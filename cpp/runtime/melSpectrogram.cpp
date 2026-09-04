@@ -642,6 +642,55 @@ MelExtractor makeWhisperExtractor()
     return MelExtractor(std::move(cfg));
 }
 
+
+MelExtractor makeWhisperSmallExtractor()
+{
+    MelExtractorConfig cfg;
+    // Standard OpenAI Whisper Small frontend.
+    cfg.name = "whisper_small";
+    // Whisper expects 16 kHz mono PCM.
+    cfg.sampleRate = 16000;
+    // 25 ms FFT/window.
+    cfg.nFFT = 400;
+    cfg.winLength = 400;
+    // 10 ms frame hop.
+    cfg.hopLength = 160;
+    // Important difference from Qwen3-ASR / Qwen3-Omni.
+    // Whisper Small uses 80 mel-frequency bins.
+    cfg.nMel = 80;
+    // Full audio frequency range at 16 kHz.
+    cfg.minFrequencyHz = 0.0f;
+    cfg.maxFrequencyHz = 8000.0f;
+    // Match Hugging Face WhisperFeatureExtractor.
+    cfg.windowType = WindowType::kHannPeriodic;
+    cfg.melScale = MelScale::kSlaney;
+    cfg.melNorm = MelNorm::kSlaney;
+    // Whisper log-mel transformation.
+    cfg.logType = LogType::kLog10;
+    cfg.logFloorMode = LogFloorMode::kMax;
+    cfg.logFloor = 1e-10f;
+    // Match:
+    // spectrogram(center=True, pad_mode="reflect")
+    cfg.framePadding = FramePadding::kCenterReflect;
+    // Whisper tensor layout:
+    // [mel_bins, time]
+    // For Whisper Small:
+    // [80, T]
+    cfg.layout = MelLayout::kMelTime;
+    // Whisper:
+    // log_spec = max(log_spec, log_spec.max() - 8)
+    // log_spec = (log_spec + 4) / 4
+    cfg.postNormalize = PostNormalize::kWhisperClamp;
+    // Do not perform mel-level static padding here.
+    // Whisper Small's fixed 30-second input preparation
+    // will be handled at the PCM level before extraction.
+    cfg.timePadding = TimePadding::kNone;
+    // Match Hugging Face Whisper:
+    // stft[..., :-1]
+    cfg.dropLastStftFrame = true;
+    return MelExtractor(std::move(cfg));
+}
+
 MelExtractor makeGemma4AudioExtractor()
 {
     // Matches HF Gemma4FeatureExtractor (USM-style front end): 20 ms periodic
@@ -734,6 +783,12 @@ MelExtractor makeExtractorByName(std::string const& feType)
     if (feType == "whisper")
     {
         return makeWhisperExtractor();
+    }
+    if (feType == "whisper_small")
+    {
+        // OpenAI Whisper Small.
+        // 80 mel bins.
+        return makeWhisperSmallExtractor();
     }
     if (feType == "parakeet")
     {

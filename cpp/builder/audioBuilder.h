@@ -136,6 +136,14 @@ private:
     //! Parse encoder-free Gemma4 Unified framed-PCM audio configuration.
     bool parseGemma4UnifiedAudioConfig();
 
+    //! Parse Whisper audio encoder configuration from root config.json.
+    bool parseWhisperAudioConfig();
+
+    //! Set up Whisper audio encoder profile.
+    //! Input: input_features [1, 80, 3000].
+    bool setupWhisperAudioEncoderProfile(
+        nvinfer1::IOptimizationProfile& profile);
+
     //! Set up optimization profile for audio encoder.
     //! Creates optimization profile with appropriate dynamic shapes for audio inputs.
     //! @param builder TensorRT builder object (must not be null)

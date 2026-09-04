@@ -39,3 +39,17 @@ target_include_directories(llm_bench PRIVATE ${COMMON_INCLUDE_DIRS}
                                              ${CMAKE_SOURCE_DIR}/examples/utils)
 target_compile_options(llm_bench PRIVATE -Wno-psabi)
 add_cross_build_link_options(llm_bench)
+
+
+add_executable(asr_persistent asr_persistent.cpp)
+
+target_link_libraries(asr_persistent PRIVATE
+  edgellmCore
+  exampleUtils
+)
+
+target_include_directories(
+  asr_persistent PRIVATE ${COMMON_INCLUDE_DIRS}
+)
+
+add_cross_build_link_options(asr_persistent)

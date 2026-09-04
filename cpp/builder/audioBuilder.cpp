@@ -373,6 +373,34 @@ bool AudioBuilder::parseGemma4UnifiedAudioConfig()
     return true;
 }
 
+
+// bool AudioBuilder::parseWhisperAudioConfig()
+// {
+//     if (!mModelConfig.contains("num_mel_bins"))
+//     {
+//         LOG_ERROR("num_mel_bins not found in Whisper config.json");
+//         return false;
+//     }
+
+//     if (!mModelConfig.contains("max_source_positions"))
+//     {
+//         LOG_ERROR("max_source_positions not found in Whisper config.json");
+//         return false;
+//     }
+
+//     mMelBins = mModelConfig["num_mel_bins"].get<int32_t>();
+
+//     int32_t const maxSourcePositions
+//         = mModelConfig["max_source_positions"].get<int32_t>();
+
+//     LOG_INFO(
+//         "Whisper AudioEncoder config: mel_bins=%d, max_source_positions=%d",
+//         mMelBins,
+//         maxSourcePositions);
+
+//     return true;
+// }
+
 bool AudioBuilder::parseAudioEncoderConfig()
 {
     auto const& audioConfig = mModelConfig["audio_config"];
@@ -488,6 +516,27 @@ bool AudioBuilder::parseNemotron35AsrAudioConfig()
     return true;
 }
 
+bool AudioBuilder::setupWhisperAudioEncoderProfile(
+    nvinfer1::IOptimizationProfile& profile)
+{
+    constexpr int64_t kBatch = 1;
+    constexpr int64_t kInputFrames = 3000;
+
+    bool const result = setOptimizationProfile(
+        &profile,
+        binding_names::kAudioInputFeatures,
+        createDims({kBatch, mMelBins, kInputFrames}),
+        createDims({kBatch, mMelBins, kInputFrames}),
+        createDims({kBatch, mMelBins, kInputFrames}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Whisper audio encoder profile");
+    }
+
+    return result;
+}
+
 bool AudioBuilder::setupAudioEncoderProfile(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
@@ -503,6 +552,9 @@ bool AudioBuilder::setupAudioEncoderProfile(
     case multimodal::ModelType::QWEN3_OMNI_NEXT_AUDIO_ENCODER:
         result = setupQwen3OmniAudioEncoderProfile(*profile);
         break;
+    case multimodal::ModelType::WHISPER_AUDIO_ENCODER:
+        result = setupWhisperAudioEncoderProfile(*profile);
+        break;
     case multimodal::ModelType::GEMMA4_UNIFIED_AUDIO: result = setupGemma4UnifiedAudioEncoderProfile(*profile); break;
     case multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER:
         result = setupNemotronOmniAudioEncoderProfile(*profile);
@@ -510,6 +562,7 @@ bool AudioBuilder::setupAudioEncoderProfile(
     case multimodal::ModelType::NEMOTRON3_5_ASR_AUDIO_ENCODER:
         result = setupNemotron35AsrEncoderProfile(*profile);
         break;
+    
     case multimodal::ModelType::GEMMA4_AUDIO_ENCODER: result = setupGemma4AudioEncoderProfile(*profile); break;
     default: LOG_ERROR("Unsupported model type for audio encoder: %d", static_cast<int>(mModelType)); return false;
     }

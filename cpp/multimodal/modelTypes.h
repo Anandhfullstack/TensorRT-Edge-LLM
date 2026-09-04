@@ -45,7 +45,8 @@ enum class ModelType
     NEMOTRON3_5_ASR_AUDIO_ENCODER, //!< Nemotron-3.5-ASR FastConformer encoder (RNN-T)
     GEMMA4_AUDIO_ENCODER,          //!< Gemma4 audio encoder
     COSMOS3_EDGE,                  //!< Cosmos3-Edge reasoner vision encoder (SigLIP2 + PatchMerger)
-    UNKNOWN                        //!< Unknown or unsupported model type
+    UNKNOWN,                        //!< Unknown or unsupported model type
+    WHISPER_AUDIO_ENCODER          //!< Whisper audio encoder
 };
 
 //! Convert string to ModelType enum
@@ -91,6 +92,8 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::GEMMA4_AUDIO_ENCODER;
     if (modelTypeStr == "cosmos3_edge" || modelTypeStr == "cosmos3_edge_vision")
         return ModelType::COSMOS3_EDGE;
+    if (modelTypeStr == "whisper_audio_encoder"|| modelTypeStr == "whisper")
+        return ModelType::WHISPER_AUDIO_ENCODER;
     return ModelType::UNKNOWN;
 }
 

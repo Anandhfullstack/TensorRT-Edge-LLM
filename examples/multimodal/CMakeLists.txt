@@ -36,3 +36,44 @@ target_include_directories(
   action_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                            ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(action_inference)
+
+add_executable(
+  whisper_encoder_inference
+  whisper_encoder_inference.cpp)
+
+target_link_libraries(
+  whisper_encoder_inference
+  PRIVATE commonLibraryExt)
+
+target_include_directories(
+  whisper_encoder_inference
+  PRIVATE
+    ${COMMON_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_cross_build_link_options(
+  whisper_encoder_inference)
+
+  add_executable(
+  whisper_audio_encoder_runtime
+  whisper_audio_encoder_runtime.cpp
+  whisper_audio_processor.cpp
+  whisper_encoder_inference.cpp)
+
+target_link_libraries(
+  whisper_audio_encoder_runtime
+  PRIVATE
+    edgellmCore
+    commonLibraryExt)
+
+target_include_directories(
+  whisper_audio_encoder_runtime
+  PRIVATE
+    ${COMMON_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_cross_build_link_options(
+  whisper_audio_encoder_runtime)
+
+
+  

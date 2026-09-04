@@ -258,6 +258,18 @@ private:
 //! Qwen3-Omni and Qwen3-ASR.
 MelExtractor makeWhisperExtractor();
 
+
+//! Build an OpenAI Whisper Small-compatible extractor
+//! (16 kHz, n_fft=400, hop=160, n_mel=80,
+//! Slaney mel scale + Slaney norm, log10,
+//! Whisper-clamp normalization, [n_mel, T] layout,
+//! HF centre-reflect framing).
+//!
+//! This extractor is separate from makeWhisperExtractor()
+//! because Qwen3-ASR / Qwen3-Omni require 128 mel bins,
+//! while Whisper Small requires 80 mel bins.
+MelExtractor makeWhisperSmallExtractor();
+
 //! Gemma4 / USM-style extractor matching HF Gemma4FeatureExtractor defaults.
 MelExtractor makeGemma4AudioExtractor();
 

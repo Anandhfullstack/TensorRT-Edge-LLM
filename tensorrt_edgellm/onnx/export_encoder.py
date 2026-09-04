@@ -163,6 +163,7 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_omni_next_thinker",
     "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
+    "whisper",  
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
 
@@ -423,7 +424,115 @@ def export_audio_onnx(
 
     build_fn = None
     extra_kwargs = {}
-    if model_type == "nemotron3_5_asr":
+
+    if model_type == "whisper":
+
+        from ..models.whisper.modeling_whisper_audio import (
+            build_whisper_audio,
+        )
+
+        from ..models.whisper.modeling_whisper_decoder import (
+            build_whisper_decoder_export,
+        )
+
+        # Whisper uses encoder-specific Hugging Face config fields
+        # rather than the normal decoder-only Edge-LLM ModelConfig fields.
+        if model_config is None:
+            from ..config import ModelConfig
+
+            d_model = int(
+                config.get("d_model", 768)
+            )
+
+            num_heads = int(
+                config.get(
+                    "encoder_attention_heads",
+                    12,
+                )
+            )
+
+            head_dim = d_model // num_heads
+
+            model_config = ModelConfig(
+                model_type="whisper",
+
+                hidden_size=d_model,
+
+                num_hidden_layers=int(
+                    config.get(
+                        "encoder_layers",
+                        12,
+                    )
+                ),
+
+                num_attention_heads=num_heads,
+
+                num_key_value_heads=num_heads,
+
+                intermediate_size=int(
+                    config.get(
+                        "encoder_ffn_dim",
+                        3072,
+                    )
+                ),
+
+                head_dim=head_dim,
+
+                rms_norm_eps=float(
+                    config.get(
+                        "layer_norm_eps",
+                        1e-5,
+                    )
+                ),
+
+                vocab_size=int(
+                    config.get(
+                        "vocab_size",
+                        51865,
+                    )
+                ),
+
+                rope_theta=10000.0,
+
+                max_position_embeddings=int(
+                    config.get(
+                        "max_source_positions",
+                        1500,
+                    )
+                ),
+
+                default_attention_scale=(
+                    head_dim ** -0.5
+                ),
+            )
+
+        logger.info(
+            "Building Whisper audio encoder ..."
+        )
+
+        build_fn = build_whisper_audio
+
+        extra_kwargs = {
+            "model_config": model_config,
+        }
+
+        # ---------------------------------------------------------
+        # Whisper decoder export
+        # ---------------------------------------------------------
+
+        if config.get("export_decoder", False):
+
+            logger.info(
+                "Building Whisper decoder ..."
+            )
+
+            build_fn = build_whisper_decoder_export
+
+            extra_kwargs = {
+                "model_config": model_config,
+                "prefix": "model.decoder.",
+            }
+    elif model_type == "nemotron3_5_asr":
         # FastConformer encoder for the RNN-T ASR model. Output frames feed
         # the RNN-T joint network (see modeling_nemotron3_5_asr_decoder.py),
         # not LLM prompt embeddings.

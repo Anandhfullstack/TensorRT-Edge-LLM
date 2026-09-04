@@ -134,6 +134,7 @@ _AUDIO_MODEL_TYPES = frozenset([
     "qwen3_omni_next_thinker",
     "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
+    "whisper",
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
     # Its Talker and CodePredictor are LLM decoders exported via the LLM pipeline.
 ])
@@ -172,6 +173,7 @@ _LLM_COMPONENTS: dict[str, frozenset[str]] = {
     # from it — thinker/talker/encoders come from the original HF root.
     "qwen3_omni_next_talker": frozenset(["code_predictor"]),
     "nemotron3_5_asr": frozenset(),  # pure RNN-T transducer
+    "whisper": frozenset(),
 }
 _DEFAULT_LLM_COMPONENTS = frozenset(["thinker"])
 
@@ -190,6 +192,12 @@ def _has_rnnt_decoder(model_type: str) -> bool:
     return model_type == "nemotron3_5_asr"
 
 
+def _has_whisper_decoder(model_type: str) -> bool:
+    """Whether ``model_type`` has a Whisper cross-attention text decoder
+    exported alongside its encoder."""
+    return model_type == "whisper"
+
+
 def _checkpoint_audio_config(config: dict) -> "dict | None":
     """Locate the audio-encoder config wherever the checkpoint stores it.
 
@@ -199,6 +207,9 @@ def _checkpoint_audio_config(config: dict) -> "dict | None":
     ``None`` when the checkpoint genuinely has no audio encoder (e.g. Gemma4
     dense with ``"audio_config": null``).
     """
+    if config.get("model_type") == "whisper":
+        return config
+  
     return (config.get("audio_config")
             or (config.get("thinker_config") or {}).get("audio_config")
             or config.get("sound_config") or config.get("encoder_config"))
@@ -239,6 +250,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "code_predictor": "code_predictor",
     "audio": "audio",
     "rnnt_decoder": "rnnt_decoder",
+    "whisper_decoder": "decoder",
     "code2wav": "code2wav",
     "visual": "visual",
     "action": "action",
@@ -2102,6 +2114,16 @@ def _export_audio(model_dir: str,
             eoa_token_id = _find_token_id(model_dir, "<audio|>")
         if eoa_token_id is not None:
             audio_cfg_out["eoa_token_id"] = eoa_token_id
+    elif model_type == "whisper":
+
+        audio_cfg = {
+            "num_mel_bins": config["num_mel_bins"],
+            "max_source_positions": config["max_source_positions"],
+        }
+        audio_cfg_out = {
+            "model_type": "whisper_audio_encoder",
+            "audio_config": audio_cfg,
+        }
     else:
         # Qwen3-family: read the nested ``audio_config`` and map top-level
         # model_type to the encoder-specific enum the C++ builder expects
@@ -2166,6 +2188,108 @@ def _copy_asr_tokenizer(model_dir: str, out_dir: str) -> None:
             logger.warning(
                 "[Audio] %s not found in checkpoint — the RNN-T runtime "
                 "needs it to detokenize.", name)
+
+
+# ---------------------------------------------------------------------------
+# Whisper cross-attention decoder export
+# ---------------------------------------------------------------------------
+
+
+def _export_whisper_decoder(model_dir: str, out_dir: str, weights: dict,
+                            config: dict, dtype: "torch.dtype") -> None:
+    """Export the Whisper text decoder (self-attn + cross-attn + LM head) to ONNX.
+
+    Full-sequence contract, matching the encoder export: given the complete
+    token prefix so far and the encoder's fixed hidden states, returns
+    logits for every position (``[batch, seq, vocab_size]``). No self-attention
+    KV cache is exported here — whether the engine is driven as a single-step
+    incremental decode (growing KV cache) or by re-running the full prefix
+    each step is a runtime/engine-build decision, deliberately left open for
+    the consuming C++ side rather than assumed here.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "model.onnx")
+    logger.info("[Whisper Decoder] Exporting to %s", output_path)
+    try:
+        from ..config import ModelConfig
+        from ..models.whisper.modeling_whisper_decoder import \
+            build_whisper_decoder_export
+        from ..onnx.export_encoder import _run_dynamo_export
+
+        d_model = int(config["d_model"])
+        num_heads = int(config["decoder_attention_heads"])
+        head_dim = d_model // num_heads
+        decoder_config = {
+            "d_model": d_model,
+            "decoder_layers": int(config["decoder_layers"]),
+            "decoder_attention_heads": num_heads,
+            "decoder_ffn_dim": int(config["decoder_ffn_dim"]),
+            "vocab_size": int(config["vocab_size"]),
+            "max_target_positions": int(config["max_target_positions"]),
+            "pad_token_id": config.get("pad_token_id"),
+        }
+        model_config = ModelConfig(
+            model_type="whisper",
+            hidden_size=d_model,
+            num_hidden_layers=decoder_config["decoder_layers"],
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            intermediate_size=decoder_config["decoder_ffn_dim"],
+            head_dim=head_dim,
+            rms_norm_eps=1e-5,
+            vocab_size=decoder_config["vocab_size"],
+            rope_theta=10000.0,
+            max_position_embeddings=decoder_config["max_target_positions"],
+            default_attention_scale=head_dim**-0.5,
+            torch_dtype="float16",
+            tie_word_embeddings=True,
+        )
+
+        model = build_whisper_decoder_export(
+            config=decoder_config,
+            weights=weights,
+            dtype=dtype,
+            prefix="model.decoder.",
+            model_config=model_config,
+        )
+        model = model.to("cpu").eval()
+        inputs, input_names, output_names, dynamic_shapes = (
+            model.get_onnx_export_args(decoder_config, "cpu"))
+        _run_dynamo_export(model, inputs, output_path, input_names,
+                           output_names, dynamic_shapes)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        logger.exception("[Whisper Decoder] ONNX export failed")
+        raise SystemExit(1) from exc
+    logger.info("[Whisper Decoder] Done: %s", output_path)
+
+    # Sidecar config for the C++ builder — same naming pattern as
+    # ``rnnt_decoder_config`` below: a ``model_type`` tag plus one
+    # component-specific config block, so the builder can auto-detect the
+    # build type purely from which key is present in the file.
+    decoder_cfg_out = {
+        "model_type": "whisper_text_decoder",
+        "whisper_decoder_config": {
+            "d_model": d_model,
+            "num_decoder_layers": decoder_config["decoder_layers"],
+            "num_attention_heads": num_heads,
+            "decoder_ffn_dim": decoder_config["decoder_ffn_dim"],
+            "vocab_size": decoder_config["vocab_size"],
+            "max_target_positions": decoder_config["max_target_positions"],
+            "pad_token_id": config.get("pad_token_id"),
+            "bos_token_id": config.get("bos_token_id"),
+            "eos_token_id": config.get("eos_token_id"),
+            # The token that actually primes generation (Whisper's SOT token,
+            # 50258 for whisper-small) — distinct from ``bos_token_id``
+            # (50257), which Whisper sets equal to ``eos``/``pad`` and is NOT
+            # the right token to seed the decode loop with.
+            "decoder_start_token_id": config.get("decoder_start_token_id"),
+        },
+    }
+    cfg_out_path = os.path.join(out_dir, "config.json")
+    with open(cfg_out_path, "w") as f:
+        json.dump(decoder_cfg_out, f, indent=2)
+    logger.info("[Whisper Decoder] Wrote config.json: %s", cfg_out_path)
+    _copy_asr_tokenizer(model_dir, out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -4039,7 +4163,7 @@ def main() -> None:
 
     _VALID_COMPONENTS = {
         "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
-        "code2wav", "action", "dllm"
+        "code2wav", "action", "dllm", "whisper_decoder"
     }
     requested_components = {
         c.strip()
@@ -4254,12 +4378,16 @@ def main() -> None:
                 # Nemotron-3.5-ASR has no LLM backbone, so the LLM-oriented
                 # ModelConfig (which requires a top-level ``hidden_size``) does
                 # not apply; its fp16 encoder does not need it.
-                model_config=(None if model_type == "nemotron3_5_asr" else
-                              _get_model_config()))),
+                model_config=(None if model_type in ("nemotron3_5_asr", "whisper",) else _get_model_config()))),
         (_has_rnnt_decoder(model_type) and not args.skip_audio
          and not _draft_only and _checkpoint_audio_config(config) is not None
          and _allow("rnnt_decoder"), "rnnt_decoder", lambda out:
          _export_rnnt_decoder(model_dir, out, _get_weights(), config, dtype)),
+        (_has_whisper_decoder(model_type) and not args.skip_audio
+         and not _draft_only and _checkpoint_audio_config(config) is not None
+         and _allow("whisper_decoder"), "whisper_decoder", lambda out:
+         _export_whisper_decoder(model_dir, out, _get_weights(), config, dtype)
+         ),
         (_has_code2wav(model_type) and not args.skip_code2wav
          and not _draft_only and _allow("code2wav"), "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),

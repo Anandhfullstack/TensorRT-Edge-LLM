@@ -285,7 +285,6 @@ print(
 print("Full-run predicted token:", full_token)
 print("Cached predicted token:", cached_token)
 
-
 passed = (
     tuple(prefill_cache.shape)
     == (12, 2, 1, 12, 4, 64)

@@ -39,6 +39,7 @@ decoder_config = {
     "decoder_ffn_dim": hf_config.decoder_ffn_dim,
     "vocab_size": hf_config.vocab_size,
     "max_target_positions": hf_config.max_target_positions,
+    "max_source_positions": hf_config.max_source_positions,
     "pad_token_id": hf_config.pad_token_id,
 }
 
@@ -74,12 +75,15 @@ model_config = ModelConfig(
 
 print("Building TensorRT-Edge-LLM Whisper decoder...")
 
+# ``with_cache=True`` matches what ``tensorrt-edgellm-export`` ships, so what is
+# debugged here is the graph that actually gets built into an engine.
 model = build_whisper_decoder_export(
     config=decoder_config,
     weights=weights,
     dtype=torch.float16,
     prefix="model.decoder.",
     model_config=model_config,
+    with_cache=True,
 )
 
 model = model.to("cpu").eval()
@@ -99,8 +103,8 @@ model = model.to("cpu").eval()
     device="cpu",
 )
 
-print("input_ids:", dynamo_inputs["input_ids"].shape)
-print("encoder_hidden_states:", dynamo_inputs["encoder_hidden_states"].shape)
+for name, tensor in zip(input_names, dynamo_inputs):
+    print(f"  {name}: {tuple(tensor.shape)}")
 print("Output names:", output_names)
 
 
@@ -119,6 +123,7 @@ _run_dynamo_export(
     input_names,
     output_names,
     dynamic_shapes,
+    
 )
 
 print("\nSUCCESS")

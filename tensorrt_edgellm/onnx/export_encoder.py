@@ -231,6 +231,7 @@ def _run_dynamo_export(
     onnx_input_names: list[str],
     output_names: list[str],
     dynamic_shapes: dict,
+    opset_version: int = _OPSET_VERSION,
 ) -> None:
     model.eval()
     translation_table = build_custom_translation_table()
@@ -257,7 +258,7 @@ def _run_dynamo_export(
         kwargs = {}
 
     logger.info("Exporting ONNX to %s (opset %d) ...", output_path,
-                _OPSET_VERSION)
+                opset_version)
     with _permissive_inline_opset():
         prog = torch.onnx.export(
             model,
@@ -267,7 +268,7 @@ def _run_dynamo_export(
             input_names=onnx_input_names,
             output_names=output_names,
             dynamic_shapes=dynamic_shapes,
-            opset_version=_OPSET_VERSION,
+            opset_version=opset_version,
             custom_translation_table=translation_table,
             external_data=True,
             optimize=True,

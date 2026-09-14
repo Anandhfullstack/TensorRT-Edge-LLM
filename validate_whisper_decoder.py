@@ -1,228 +1,229 @@
-import torch
+from pathlib import Path
 
-from transformers import WhisperForConditionalGeneration
+import numpy as np
+import onnx
+import onnxruntime as ort
 
-from tensorrt_edgellm.models.whisper.modeling_whisper_decoder import (
-    build_whisper_decoder,
+
+ONNX_PATH = Path(
+    "whisper_small_onnx/decoder/model.onnx"
 )
-from tensorrt_edgellm.config import ModelConfig
+
+EXPECTED_INPUTS = [
+    "input_ids",
+    "position_ids",
+    "past_key_values",
+    "cross_key_values",
+]
+
+EXPECTED_OUTPUTS = [
+    "logits",
+    "present_key_values",
+]
 
 
-DEVICE = "cuda"
-MODEL_NAME = "openai/whisper-small"
+def print_session_contract(session):
+    print("\nInputs:")
+
+    for value in session.get_inputs():
+        print(
+            f"  {value.name}: "
+            f"shape={value.shape}, type={value.type}"
+        )
+
+    print("\nOutputs:")
+
+    for value in session.get_outputs():
+        print(
+            f"  {value.name}: "
+            f"shape={value.shape}, type={value.type}"
+        )
 
 
 def main():
+    if not ONNX_PATH.exists():
+        raise FileNotFoundError(
+            f"ONNX model not found: {ONNX_PATH}"
+        )
 
-    dtype = torch.float16
+    # ---------------------------------------------------------
+    # Structural validation
+    # ---------------------------------------------------------
 
-    print("=" * 80)
-    print("Loading Hugging Face Whisper")
-    print("=" * 80)
+    print("Checking ONNX structure...")
 
-    hf_model = WhisperForConditionalGeneration.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=dtype,
-    ).to(DEVICE)
-
-    hf_model.eval()
-
-    config = hf_model.config
-
-    decoder_config = {
-        "d_model": config.d_model,
-        "decoder_layers": config.decoder_layers,
-        "decoder_attention_heads": config.decoder_attention_heads,
-        "decoder_ffn_dim": config.decoder_ffn_dim,
-        "vocab_size": config.vocab_size,
-        "max_target_positions": config.max_target_positions,
-        "pad_token_id": config.pad_token_id,
-    }
-
-    model_config = ModelConfig(
-        model_type="whisper",
-        hidden_size=config.d_model,
-        num_hidden_layers=config.decoder_layers,
-        num_attention_heads=config.decoder_attention_heads,
-        num_key_value_heads=config.decoder_attention_heads,
-        intermediate_size=config.decoder_ffn_dim,
-        head_dim=config.d_model // config.decoder_attention_heads,
-        rms_norm_eps=1e-5,
-        vocab_size=config.vocab_size,
-        rope_theta=10000,
-        max_position_embeddings=config.max_target_positions,
-        default_attention_scale=1.0,
-        torch_dtype="float16",
-        tie_word_embeddings=True,
+    onnx.checker.check_model(
+        str(ONNX_PATH),
+        full_check=True,
     )
 
-    native_decoder = build_whisper_decoder(
-        config=decoder_config,
-        weights=hf_model.state_dict(),
-        dtype=dtype,
-        prefix="model.decoder.",
-        model_config=model_config,
-    ).to(DEVICE)
+    print("ONNX structural check: PASS")
 
-    native_decoder.eval()
+    # ---------------------------------------------------------
+    # Select ONNX Runtime provider
+    # ---------------------------------------------------------
 
-    input_ids = torch.tensor(
-        [[50258, 50359, 50363, 2425, 1917, 13, 50257, 50256]],
-        dtype=torch.long,
-        device=DEVICE,
+    available = ort.get_available_providers()
+
+    if "CUDAExecutionProvider" in available:
+        providers = [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+    else:
+        providers = ["CPUExecutionProvider"]
+
+    print("Providers:", providers)
+
+    session = ort.InferenceSession(
+        str(ONNX_PATH),
+        providers=providers,
     )
 
-    encoder_hidden_states = torch.randn(
+    print_session_contract(session)
+
+    actual_inputs = [
+        value.name for value in session.get_inputs()
+    ]
+
+    actual_outputs = [
+        value.name for value in session.get_outputs()
+    ]
+
+    assert actual_inputs == EXPECTED_INPUTS, (
+        f"\nWrong inputs.\n"
+        f"Expected: {EXPECTED_INPUTS}\n"
+        f"Actual:   {actual_inputs}"
+    )
+
+    assert actual_outputs == EXPECTED_OUTPUTS, (
+        f"\nWrong outputs.\n"
+        f"Expected: {EXPECTED_OUTPUTS}\n"
+        f"Actual:   {actual_outputs}"
+    )
+
+    # ---------------------------------------------------------
+    # Cross-attention cache: produced once by the cross_kv engine and
+    # bound read-only for every step. Zeros are enough here — this is a
+    # contract/shape check, not a numerical one.
+    # ---------------------------------------------------------
+
+    cross_key_values = np.zeros(
+        (12, 2, 1, 12, 1500, 64),
+        dtype=np.float16,
+    )
+
+    # ---------------------------------------------------------
+    # Prefill: four tokens, empty cache
+    # ---------------------------------------------------------
+
+    prefill_ids = np.array(
+        [[50258, 50359, 50363, 2425]],
+        dtype=np.int64,
+    )
+
+    prefill_positions = np.array(
+        [[0, 1, 2, 3]],
+        dtype=np.int64,
+    )
+
+    empty_cache = np.empty(
+        (12, 2, 1, 12, 0, 64),
+        dtype=np.float16,
+    )
+
+    prefill_logits, cache_4 = session.run(
+        EXPECTED_OUTPUTS,
+        {
+            "input_ids": prefill_ids,
+            "position_ids": prefill_positions,
+            "past_key_values": empty_cache,
+            "cross_key_values": cross_key_values,
+        },
+    )
+
+    assert prefill_logits.shape == (
         1,
-        1500,
-        config.d_model,
-        dtype=dtype,
-        device=DEVICE,
+        4,
+        51865,
     )
 
-    hf_debug = {}
-
-    layer = hf_model.model.decoder.layers[11]
-
-    layer.fc1.register_forward_hook(
-        lambda m, i, o: hf_debug.update({"fc1": o.detach()})
+    assert cache_4.shape == (
+        12,
+        2,
+        1,
+        12,
+        4,
+        64,
     )
 
-    layer.fc2.register_forward_hook(
-        lambda m, i, o: hf_debug.update({"fc2": o.detach()})
+    assert np.isfinite(prefill_logits).all()
+    assert np.isfinite(cache_4).all()
+
+    next_token = int(
+        np.argmax(prefill_logits[0, -1])
     )
 
-    layer.self_attn.register_forward_hook(
-        lambda m, i, o: hf_debug.update({"self_attn": o[0].detach()})
+    print("\nPrefill: PASS")
+    print("  logits:", prefill_logits.shape)
+    print("  cache:", cache_4.shape)
+    print("  next token:", next_token)
+
+    # ---------------------------------------------------------
+    # Decode: one token, cache length four
+    # ---------------------------------------------------------
+
+    decode_ids = np.array(
+        [[next_token]],
+        dtype=np.int64,
     )
 
-    layer.encoder_attn.register_forward_hook(
-        lambda m, i, o: hf_debug.update({"cross_attn": o[0].detach()})
+    decode_positions = np.array(
+        [[4]],
+        dtype=np.int64,
     )
 
-    layer.register_forward_hook(
-        lambda m, i, o: hf_debug.update({"layer11_output": o.detach()})
+    decode_logits, cache_5 = session.run(
+        EXPECTED_OUTPUTS,
+        {
+            "input_ids": decode_ids,
+            "position_ids": decode_positions,
+            "past_key_values": cache_4,
+            "cross_key_values": cross_key_values,
+        },
     )
 
-
-    with torch.no_grad():
-
-        hf_out = hf_model.model.decoder(
-            input_ids=input_ids,
-            encoder_hidden_states=encoder_hidden_states,
-            output_hidden_states=True,
-        )
-
-        hf_hidden = hf_out.last_hidden_state
-        hf_layers = hf_out.hidden_states
-        hf_logits = hf_model.proj_out(hf_hidden)
-
-
-        native_hidden, native_layers, native_debug = native_decoder(
-            input_ids,
-            encoder_hidden_states,
-        )
-
-
-    print("=" * 80)
-    print("Layer comparison")
-    print("=" * 80)
-
-    for i in range(config.decoder_layers):
-
-        diff = (
-            hf_layers[i]
-            -
-            (native_layers[i-1] if i > 0 else hf_layers[0])
-        ).abs()
-
-        print(
-            f"Layer {i} input max:",
-            diff.max().item()
-        )
-
-
-    print()
-    print("=" * 80)
-    print("Layer 11 pre-final-norm comparison")
-    print("=" * 80)
-
-
-    diff = (
-        hf_debug["layer11_output"]
-        -
-        native_layers[11]
-    ).abs()
-
-
-    print(
-        "max:",
-        diff.max().item()
+    assert decode_logits.shape == (
+        1,
+        1,
+        51865,
     )
 
-    print(
-        "mean:",
-        diff.mean().item()
+    assert cache_5.shape == (
+        12,
+        2,
+        1,
+        12,
+        5,
+        64,
     )
 
+    assert np.isfinite(decode_logits).all()
+    assert np.isfinite(cache_5).all()
 
-    print("=" * 80)
-    print("Layer 11 FFN comparison")
-    print("=" * 80)
-
-    native_debug11 = native_debug[11]
-
-    for name, hf_tensor, native_tensor in [
-        ("fc1", hf_debug["fc1"], native_debug11["ffn_fc1"]),
-        ("fc2", hf_debug["fc2"], native_debug11["ffn_fc2"]),
-        ("self_attn", hf_debug["self_attn"], native_debug11["self_attn_output"]),
-        ("cross_attn", hf_debug["cross_attn"], native_debug11["cross_attn_output"]),
-    ]:
-
-        diff = (hf_tensor - native_tensor).abs()
-
-        print(
-            name,
-            "max:",
-            diff.max().item(),
-            "mean:",
-            diff.mean().item(),
-        )
-
-
-    print("=" * 80)
-    print("Final comparison")
-    print("=" * 80)
-
-    hidden_diff = (hf_hidden - native_hidden).abs()
-
-    print(
-        "hidden max:",
-        hidden_diff.max().item()
+    second_token = int(
+        np.argmax(decode_logits[0, -1])
     )
 
-    print(
-        "hidden mean:",
-        hidden_diff.mean().item()
-    )
+    print("\nDecode: PASS")
+    print("  logits:", decode_logits.shape)
+    print("  cache:", cache_5.shape)
+    print("  next token:", second_token)
 
-
-    native_logits = torch.nn.functional.linear(
-        native_hidden,
-        native_decoder.embed_tokens.weight,
-    )
-
-    logits_diff = (hf_logits - native_logits).abs()
-
-    print(
-        "logits max:",
-        logits_diff.max().item()
-    )
-
-    print(
-        "logits mean:",
-        logits_diff.mean().item()
-    )
+    print("\n===================================")
+    print("CACHED ONNX EXPORT VALIDATION: PASS")
+    print("Cache growth: 0 -> 4 -> 5")
+    print("===================================")
 
 
 if __name__ == "__main__":

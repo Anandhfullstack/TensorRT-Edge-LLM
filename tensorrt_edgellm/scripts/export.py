@@ -251,6 +251,7 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "audio": "audio",
     "rnnt_decoder": "rnnt_decoder",
     "whisper_decoder": "decoder",
+    "whisper_cross_kv": "cross_kv",
     "code2wav": "code2wav",
     "visual": "visual",
     "action": "action",
@@ -2195,55 +2196,131 @@ def _copy_asr_tokenizer(model_dir: str, out_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _whisper_decoder_configs(config: dict) -> tuple:
+    """Translate Whisper's HF config into the decoder + ``ModelConfig`` pair.
+
+    Whisper names its decoder fields ``d_model`` / ``decoder_attention_heads``
+    rather than the ``hidden_size`` / ``num_attention_heads`` this framework's
+    ``ModelConfig`` expects, so the mapping is explicit. Shared by the decoder
+    and cross-KV exports so the two graphs cannot disagree on geometry.
+    """
+    from ..config import ModelConfig
+
+    d_model = int(config["d_model"])
+    num_heads = int(config["decoder_attention_heads"])
+    head_dim = d_model // num_heads
+    decoder_config = {
+        "d_model": d_model,
+        "decoder_layers": int(config["decoder_layers"]),
+        "decoder_attention_heads": num_heads,
+        "decoder_ffn_dim": int(config["decoder_ffn_dim"]),
+        "vocab_size": int(config["vocab_size"]),
+        "max_target_positions": int(config["max_target_positions"]),
+        "max_source_positions": int(config.get("max_source_positions", 1500)),
+        "pad_token_id": config.get("pad_token_id"),
+    }
+    model_config = ModelConfig(
+        model_type="whisper",
+        hidden_size=d_model,
+        num_hidden_layers=decoder_config["decoder_layers"],
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        intermediate_size=decoder_config["decoder_ffn_dim"],
+        head_dim=head_dim,
+        rms_norm_eps=1e-5,
+        vocab_size=decoder_config["vocab_size"],
+        rope_theta=10000.0,
+        max_position_embeddings=decoder_config["max_target_positions"],
+        default_attention_scale=head_dim**-0.5,
+        torch_dtype="float16",
+        tie_word_embeddings=True,
+    )
+    return decoder_config, model_config, head_dim
+
+
+def _export_whisper_cross_kv(model_dir: str, out_dir: str, weights: dict,
+                             config: dict, dtype: "torch.dtype") -> None:
+    """Export the one-shot encoder K/V projector to ONNX.
+
+    Cross-attention K/V depends only on the encoder output, which is fixed for
+    the whole generation, so projecting it every decode step is wasted work.
+    This engine runs once between the encoder and the decode loop and carries
+    only the ``2 * num_layers`` projection weights (~28 MB FP16 for
+    whisper-small) rather than a second copy of the decoder.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "model.onnx")
+    logger.info("[Whisper CrossKV] Exporting to %s", output_path)
+    try:
+        from ..models.whisper.modeling_whisper_decoder import \
+            build_whisper_cross_kv_export
+        from ..onnx.export_encoder import _run_dynamo_export
+
+        decoder_config, model_config, head_dim = _whisper_decoder_configs(
+            config)
+
+        model = build_whisper_cross_kv_export(
+            config=decoder_config,
+            weights=weights,
+            dtype=dtype,
+            prefix="model.decoder.",
+            model_config=model_config,
+        )
+        model = model.to("cpu").eval()
+        inputs, input_names, output_names, dynamic_shapes = (
+            model.get_onnx_export_args(decoder_config, "cpu"))
+        _run_dynamo_export(model, inputs, output_path, input_names,
+                           output_names, dynamic_shapes)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        logger.exception("[Whisper CrossKV] ONNX export failed")
+        raise SystemExit(1) from exc
+    logger.info("[Whisper CrossKV] Done: %s", output_path)
+
+    cross_cfg_out = {
+        "model_type": "whisper_cross_kv",
+        "whisper_cross_kv_config": {
+            "d_model": decoder_config["d_model"],
+            "num_decoder_layers": decoder_config["decoder_layers"],
+            "num_attention_heads": decoder_config["decoder_attention_heads"],
+            "head_dim": head_dim,
+            "max_source_positions": decoder_config["max_source_positions"],
+            "output_layout": ("[num_decoder_layers, 2, batch, "
+                              "num_attention_heads, max_source_positions, "
+                              "head_dim]"),
+        },
+    }
+    cfg_out_path = os.path.join(out_dir, "config.json")
+    with open(cfg_out_path, "w") as f:
+        json.dump(cross_cfg_out, f, indent=2)
+    logger.info("[Whisper CrossKV] Wrote config.json: %s", cfg_out_path)
+
+
 def _export_whisper_decoder(model_dir: str, out_dir: str, weights: dict,
                             config: dict, dtype: "torch.dtype") -> None:
     """Export the Whisper text decoder (self-attn + cross-attn + LM head) to ONNX.
 
-    Full-sequence contract, matching the encoder export: given the complete
-    token prefix so far and the encoder's fixed hidden states, returns
-    logits for every position (``[batch, seq, vocab_size]``). No self-attention
-    KV cache is exported here — whether the engine is driven as a single-step
-    incremental decode (growing KV cache) or by re-running the full prefix
-    each step is a runtime/engine-build decision, deliberately left open for
-    the consuming C++ side rather than assumed here.
+    One graph serves both decode phases. Prefill passes the forced prefix with
+    an empty cache (``past_length == 0``); decode passes one token with the
+    accumulated cache. Both ``sequence`` and ``past_length`` are dynamic, so a
+    single engine covers both instead of duplicating the decoder weights across
+    a separate prefill and decode engine.
+
+    Self-attention KV is engine I/O, stacked into one tensor
+    (``[num_layers, 2, batch, num_heads, past_length, head_dim]``) so the
+    runtime binds a single contiguous buffer. Cross-attention K/V arrives
+    pre-projected from the cross-KV engine and is read-only, so it is taken as
+    an input and not returned.
     """
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "model.onnx")
     logger.info("[Whisper Decoder] Exporting to %s", output_path)
     try:
-        from ..config import ModelConfig
         from ..models.whisper.modeling_whisper_decoder import \
             build_whisper_decoder_export
         from ..onnx.export_encoder import _run_dynamo_export
 
-        d_model = int(config["d_model"])
-        num_heads = int(config["decoder_attention_heads"])
-        head_dim = d_model // num_heads
-        decoder_config = {
-            "d_model": d_model,
-            "decoder_layers": int(config["decoder_layers"]),
-            "decoder_attention_heads": num_heads,
-            "decoder_ffn_dim": int(config["decoder_ffn_dim"]),
-            "vocab_size": int(config["vocab_size"]),
-            "max_target_positions": int(config["max_target_positions"]),
-            "pad_token_id": config.get("pad_token_id"),
-        }
-        model_config = ModelConfig(
-            model_type="whisper",
-            hidden_size=d_model,
-            num_hidden_layers=decoder_config["decoder_layers"],
-            num_attention_heads=num_heads,
-            num_key_value_heads=num_heads,
-            intermediate_size=decoder_config["decoder_ffn_dim"],
-            head_dim=head_dim,
-            rms_norm_eps=1e-5,
-            vocab_size=decoder_config["vocab_size"],
-            rope_theta=10000.0,
-            max_position_embeddings=decoder_config["max_target_positions"],
-            default_attention_scale=head_dim**-0.5,
-            torch_dtype="float16",
-            tie_word_embeddings=True,
-        )
+        decoder_config, model_config, head_dim = _whisper_decoder_configs(
+            config)
 
         model = build_whisper_decoder_export(
             config=decoder_config,
@@ -2251,6 +2328,7 @@ def _export_whisper_decoder(model_dir: str, out_dir: str, weights: dict,
             dtype=dtype,
             prefix="model.decoder.",
             model_config=model_config,
+            with_cache=True,
         )
         model = model.to("cpu").eval()
         inputs, input_names, output_names, dynamic_shapes = (
@@ -2269,12 +2347,26 @@ def _export_whisper_decoder(model_dir: str, out_dir: str, weights: dict,
     decoder_cfg_out = {
         "model_type": "whisper_text_decoder",
         "whisper_decoder_config": {
-            "d_model": d_model,
+            "d_model": decoder_config["d_model"],
             "num_decoder_layers": decoder_config["decoder_layers"],
-            "num_attention_heads": num_heads,
+            "num_attention_heads":
+            decoder_config["decoder_attention_heads"],
+            "head_dim": head_dim,
             "decoder_ffn_dim": decoder_config["decoder_ffn_dim"],
             "vocab_size": decoder_config["vocab_size"],
             "max_target_positions": decoder_config["max_target_positions"],
+            "max_source_positions": decoder_config["max_source_positions"],
+            # One engine covers both phases: prefill binds an empty cache
+            # (past_length 0), decode binds the accumulated one. The optimization
+            # profile therefore needs past_length min 0, max max_target_positions.
+            "kv_cache_layout": ("[num_decoder_layers, 2, batch, "
+                                "num_attention_heads, past_length, head_dim]"),
+            # Produced once by the cross_kv engine, then bound read-only for
+            # every step — fixed length, never returned by this graph.
+            "cross_kv_layout": ("[num_decoder_layers, 2, batch, "
+                                "num_attention_heads, max_source_positions, "
+                                "head_dim]"),
+            "supports_prefill_and_decode": True,
             "pad_token_id": config.get("pad_token_id"),
             "bos_token_id": config.get("bos_token_id"),
             "eos_token_id": config.get("eos_token_id"),
@@ -4163,7 +4255,7 @@ def main() -> None:
 
     _VALID_COMPONENTS = {
         "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
-        "code2wav", "action", "dllm", "whisper_decoder"
+        "code2wav", "action", "dllm", "whisper_decoder", "whisper_cross_kv"
     }
     requested_components = {
         c.strip()
@@ -4387,6 +4479,11 @@ def main() -> None:
          and not _draft_only and _checkpoint_audio_config(config) is not None
          and _allow("whisper_decoder"), "whisper_decoder", lambda out:
          _export_whisper_decoder(model_dir, out, _get_weights(), config, dtype)
+         ),
+        (_has_whisper_decoder(model_type) and not args.skip_audio
+         and not _draft_only and _checkpoint_audio_config(config) is not None
+         and _allow("whisper_cross_kv"), "whisper_cross_kv", lambda out:
+         _export_whisper_cross_kv(model_dir, out, _get_weights(), config, dtype)
          ),
         (_has_code2wav(model_type) and not args.skip_code2wav
          and not _draft_only and _allow("code2wav"), "code2wav",

@@ -121,7 +121,7 @@ bool WhisperAudioProcessor::processFile(
     // IMPORTANT:
     // Padding is performed on PCM, NOT on the mel tensor.
     // --------------------------------------------------------
-
+    mLastAudioDurationSeconds   = static_cast<double>(pcm.samples.size()) / static_cast<double>(pcm.sampleRate);
     padOrTrimPcm(pcm);
 
     // --------------------------------------------------------
@@ -131,7 +131,6 @@ bool WhisperAudioProcessor::processFile(
     //
     // FP32 CPU [80, 3000]
     // --------------------------------------------------------
-
     rt::Tensor melTensor;
 
     if (!mMelExtractor.extract(

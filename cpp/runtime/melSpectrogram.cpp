@@ -83,21 +83,47 @@ void dft(float const* in, int32_t n, float* out, SinCosTable const& tbl) noexcep
     {
         float re = 0.0f;
         float im = 0.0f;
+        // ``(i * k * step) mod size`` walked as an arithmetic progression: the
+        // closed form needs an integer division per tap, which dominates this
+        // loop for the nFFT=400 -> dft(25) base case.
+        int32_t const inc = (k * step) % tbl.size;
+        int32_t idx = 0;
         for (int32_t i = 0; i < n; ++i)
         {
-            int32_t const idx = ((k * i) * step) % tbl.size;
             re += in[i] * tbl.cosT[idx];
             im -= in[i] * tbl.sinT[idx];
+            idx += inc;
+            if (idx >= tbl.size)
+            {
+                idx -= tbl.size;
+            }
         }
         out[k * 2 + 0] = re;
         out[k * 2 + 1] = im;
     }
 }
 
+//! Scratch floats ``fft()`` needs for an ``n``-point transform: each even level
+//! takes ``3n`` (split halves + two complex child outputs) and hands the
+//! remainder to its children, so ``S(n) = 3n + S(n/2)`` down to the first odd
+//! level, which needs none.
+int32_t fftScratchSize(int32_t n) noexcept
+{
+    int32_t total = 0;
+    for (; n > 1 && (n & 1) == 0; n /= 2)
+    {
+        total += 3 * n;
+    }
+    return total;
+}
+
 //! Cooley-Tukey radix-2 FFT. Recursive, in/out are real input → complex out
 //! (interleaved (re, im), size 2*N). Falls back to ``dft()`` when N is odd.
-//! Not noexcept: allocates ``std::vector<float>`` scratch buffers per recursion.
-void fft(float const* in, int32_t n, float* out, SinCosTable const& tbl)
+//!
+//! ``scratch`` must hold at least ``fftScratchSize(n)`` floats. Both children
+//! share ``childScratch``: the recursive calls are sequential and write their
+//! results into ``evenOut`` / ``oddOut``, which lie outside that region.
+void fft(float const* in, int32_t n, float* out, SinCosTable const& tbl, float* scratch) noexcept
 {
     if (n == 1)
     {
@@ -112,22 +138,27 @@ void fft(float const* in, int32_t n, float* out, SinCosTable const& tbl)
     }
 
     int32_t const half = n / 2;
-    std::vector<float> even(half), odd(half);
+    float* even = scratch;
+    float* odd = even + half;
+    float* evenOut = odd + half;
+    float* oddOut = evenOut + n;
+    float* childScratch = oddOut + n;
+
     for (int32_t i = 0; i < half; ++i)
     {
         even[i] = in[2 * i + 0];
         odd[i] = in[2 * i + 1];
     }
 
-    std::vector<float> evenOut(2 * half);
-    std::vector<float> oddOut(2 * half);
-    fft(even.data(), half, evenOut.data(), tbl);
-    fft(odd.data(), half, oddOut.data(), tbl);
+    fft(even, half, evenOut, tbl, childScratch);
+    fft(odd, half, oddOut, tbl, childScratch);
 
     int32_t const step = tbl.size / n;
     for (int32_t k = 0; k < half; ++k)
     {
-        int32_t const idx = (k * step) % tbl.size;
+        // ``k < n/2`` and ``step == tbl.size / n``, so ``k * step`` stays below
+        // ``tbl.size / 2``; no wrap is possible here.
+        int32_t const idx = k * step;
         float const c = tbl.cosT[idx];
         float const s = -tbl.sinT[idx];
 
@@ -303,14 +334,27 @@ std::vector<float> buildMelFilterBank(int32_t sampleRate, int32_t nFFT, int32_t 
 
 } // namespace
 
+//! Non-zero extent of one mel filter. Triangular filters touch only a short
+//! contiguous run of FFT bins (Whisper small: 4.9 of 201 on average), so the
+//! dense ``[nMel x nBins]`` bank is ~98% zeros.
+struct MelBand
+{
+    int32_t firstBin{0};   //!< Index of the first bin in the band.
+    int32_t numBins{0};    //!< Bins spanned; 0 for an all-zero filter.
+    int32_t weightOffset{0}; //!< Start of this band's run inside melBandWeights.
+};
+
 struct MelExtractor::Impl
 {
     std::vector<float> windowFn;         //!< Length winLength.
     std::vector<float> melFilterStorage; //!< Used only when config.melFilter is null.
     float const* melFilterPtr{nullptr};
+    std::vector<MelBand> melBands;       //!< One per mel, indexes melBandWeights.
+    std::vector<float> melBandWeights;   //!< Bands concatenated in mel order.
     int32_t nBins{0};
     std::vector<float> preempBuf; //!< Scratch for full-waveform preemph.
     SinCosTable sinCos;           //!< Twiddle factors, size = cfg.nFFT (built at init).
+    std::vector<float> fftScratch; //!< Recursion workspace, size = fftScratchSize(cfg.nFFT).
 };
 
 MelExtractor::MelExtractor(MelExtractorConfig cfg)
@@ -329,6 +373,7 @@ MelExtractor::MelExtractor(MelExtractorConfig cfg)
     mImpl->windowFn = buildWindow(mConfig.winLength, mConfig.windowType);
     mImpl->nBins = mConfig.nFFT / 2 + 1;
     mImpl->sinCos.build(mConfig.nFFT);
+    mImpl->fftScratch.assign(static_cast<size_t>(fftScratchSize(mConfig.nFFT)), 0.0f);
 
     float const fMax = (mConfig.maxFrequencyHz > 0.0f) ? mConfig.maxFrequencyHz : 0.5f * mConfig.sampleRate;
 
@@ -341,6 +386,39 @@ MelExtractor::MelExtractor(MelExtractorConfig cfg)
         mImpl->melFilterStorage = buildMelFilterBank(mConfig.sampleRate, mConfig.nFFT, mConfig.nMel,
             mConfig.minFrequencyHz, fMax, mConfig.melScale, mConfig.melNorm, mConfig.triangulariseInMelSpace);
         mImpl->melFilterPtr = mImpl->melFilterStorage.data();
+    }
+
+    // Collapse the dense bank to per-mel bands. The span runs from the first
+    // to the last non-zero weight, so interior zeros (if any) are retained and
+    // the accumulation order within a mel is unchanged.
+    mImpl->melBands.resize(static_cast<size_t>(mConfig.nMel));
+    mImpl->melBandWeights.clear();
+    for (int32_t m = 0; m < mConfig.nMel; ++m)
+    {
+        float const* row = mImpl->melFilterPtr + static_cast<size_t>(m) * mImpl->nBins;
+        int32_t first = -1;
+        int32_t last = -1;
+        for (int32_t k = 0; k < mImpl->nBins; ++k)
+        {
+            if (row[k] != 0.0f)
+            {
+                if (first < 0)
+                {
+                    first = k;
+                }
+                last = k;
+            }
+        }
+
+        MelBand band;
+        band.weightOffset = static_cast<int32_t>(mImpl->melBandWeights.size());
+        if (first >= 0)
+        {
+            band.firstBin = first;
+            band.numBins = last - first + 1;
+            mImpl->melBandWeights.insert(mImpl->melBandWeights.end(), row + first, row + last + 1);
+        }
+        mImpl->melBands[static_cast<size_t>(m)] = band;
     }
 }
 
@@ -533,7 +611,7 @@ bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
 
         // Full complex FFT (we discard the upper-half conjugate symmetric bins
         // afterwards by reading only the first nBins = nFFT/2+1 entries).
-        fft(framedSamples.data(), nFFT, fftOut.data(), mImpl->sinCos);
+        fft(framedSamples.data(), nFFT, fftOut.data(), mImpl->sinCos, mImpl->fftScratch.data());
 
         for (int32_t k = 0; k < nBins; ++k)
         {
@@ -545,11 +623,14 @@ bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
 
         for (int32_t m = 0; m < nMel; ++m)
         {
+            MelBand const& band = mImpl->melBands[static_cast<size_t>(m)];
+            float const* filterRow = mImpl->melBandWeights.data() + band.weightOffset;
+            float const* bandPower = power.data() + band.firstBin;
+
             float acc = 0.0f;
-            float const* filterRow = mImpl->melFilterPtr + static_cast<size_t>(m) * nBins;
-            for (int32_t k = 0; k < nBins; ++k)
+            for (int32_t k = 0; k < band.numBins; ++k)
             {
-                acc += filterRow[k] * power[k];
+                acc += filterRow[k] * bandPower[k];
             }
             float const value = (mConfig.logFloorMode == LogFloorMode::kMax) ? std::max(acc, mConfig.logFloor)
                                                                              : acc + mConfig.logFloor;

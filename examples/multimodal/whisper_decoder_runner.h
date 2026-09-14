@@ -20,8 +20,9 @@ namespace whisper
 class WhisperDecoderRunner
 {
 public:
-    explicit WhisperDecoderRunner(
-        std::string enginePath);
+    WhisperDecoderRunner(
+        std::string crossKvEnginePath,
+        std::string decoderEnginePath);
 
     ~WhisperDecoderRunner();
 
@@ -33,20 +34,43 @@ public:
         int32_t maxNewTokens = 32);
 
 private:
-    std::string mEnginePath;
+    std::string mCrossKvEnginePath;
+    std::string mDecoderEnginePath;
 
+    // One TensorRT runtime can own both engines.
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
-    std::unique_ptr<nvinfer1::IExecutionContext> mContext;
 
+    std::unique_ptr<nvinfer1::ICudaEngine>
+        mCrossKvEngine;
+    std::unique_ptr<nvinfer1::ICudaEngine>
+        mDecoderEngine;
+
+    std::unique_ptr<nvinfer1::IExecutionContext>
+        mCrossKvContext;
+    std::unique_ptr<nvinfer1::IExecutionContext>
+        mDecoderContext;
+
+    // Both engines execute sequentially on this stream.
     cudaStream_t mStream{nullptr};
 
-    void* mInputIdsDevice{nullptr};
+    // Cross-KV engine buffers
     void* mEncoderDevice{nullptr};
+    void* mCrossKeyValuesDevice{nullptr};
+
+    // Decoder engine buffers
+    void* mInputIdsDevice{nullptr};
+    void* mPositionIdsDevice{nullptr};
     void* mLogitsDevice{nullptr};
 
+    // Growing self-attention cache
+    void* mPastKeyValuesDevice{nullptr};
+    void* mPresentKeyValuesDevice{nullptr};
+
     nvinfer1::DataType mInputIdsType{};
+    nvinfer1::DataType mPositionIdsType{};
     nvinfer1::DataType mLogitsType{};
+    nvinfer1::DataType mCacheType{};
+    nvinfer1::DataType mCrossKeyValuesType{};
 
     int64_t mVocabSize{0};
 };

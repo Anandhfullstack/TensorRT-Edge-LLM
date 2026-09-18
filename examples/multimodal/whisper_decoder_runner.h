@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -34,6 +35,27 @@ public:
         int32_t maxNewTokens = 32);
 
 private:
+    //! Run one decoder pass over ``count`` tokens starting at cache slot
+    //! ``mCacheLength``, and return the argmax of the final position's logits.
+    //! Advances ``mCacheLength`` by ``count``.
+    int64_t runDecoderStep(
+        int64_t const* tokens,
+        int32_t count);
+
+    //! Element size of the self-attention cache dtype.
+    std::size_t cacheElementSize() const noexcept;
+
+    //! Bytes in one row of logits (``mVocabSize`` elements).
+    std::size_t logitsRowBytes() const noexcept;
+
+    //! Capture the single-token decode step into a CUDA graph: the three
+    //! scalar H2D copies, ``enqueueV3``, and the logits D2H. Only the 1-token
+    //! path is captured; the prefill uses a different ``input_ids`` extent and
+    //! stays on ``enqueueV3``. Failure is non-fatal — the runner falls back to
+    //! ``enqueueV3`` for every step.
+    bool captureDecodeGraph();
+
+private:
     std::string mCrossKvEnginePath;
     std::string mDecoderEnginePath;
 
@@ -60,11 +82,20 @@ private:
     // Decoder engine buffers
     void* mInputIdsDevice{nullptr};
     void* mPositionIdsDevice{nullptr};
+    void* mCachePositionDevice{nullptr};
     void* mLogitsDevice{nullptr};
 
-    // Growing self-attention cache
-    void* mPastKeyValuesDevice{nullptr};
-    void* mPresentKeyValuesDevice{nullptr};
+    //! Fixed-capacity self-attention cache, [12, 2, 1, 12, 448, 64]. The decoder
+    //! scatters each step's K/V into slot `cache_position`, so past and present
+    //! bind to this one allocation and the shape never changes.
+    void* mSelfKeyValuesDevice{nullptr};
+
+    //! Pinned staging for the per-step scalars. Pageable sources make
+    //! cudaMemcpyAsync fall back to a synchronous copy.
+    int64_t* mInputIdsHost{nullptr};
+    int64_t* mPositionIdsHost{nullptr};
+    int64_t* mCachePositionHost{nullptr};
+    void* mLogitsHost{nullptr};
 
     nvinfer1::DataType mInputIdsType{};
     nvinfer1::DataType mPositionIdsType{};
@@ -73,6 +104,16 @@ private:
     nvinfer1::DataType mCrossKeyValuesType{};
 
     int64_t mVocabSize{0};
+
+    //! Tokens written to the cache so far; also the next write slot.
+    int64_t mCacheLength{0};
+
+    //! Captured single-token decode step. Valid only while every binding
+    //! address and the 1-token input shapes stay fixed, which the fixed-capacity
+    //! cache guarantees.
+    cudaGraph_t mDecodeGraph{nullptr};
+    cudaGraphExec_t mDecodeGraphExec{nullptr};
+    bool mDecodeGraphReady{false};
 };
 
 } // namespace whisper

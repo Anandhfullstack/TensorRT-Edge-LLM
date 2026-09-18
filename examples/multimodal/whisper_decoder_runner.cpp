@@ -1,9 +1,11 @@
 #include "whisper_decoder_runner.h"
 
 #include "common/logger.h"
+#include "common/cudaUtils.h"
 #include "common/trtUtils.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -30,11 +32,27 @@ constexpr char const* kPresentKeyValues = "present_key_values";
 constexpr char const* kCrossKeyValues
     = "cross_key_values";
 
+constexpr char const* kCachePosition
+    = "cache_position";
+
 constexpr int64_t kBatch = 1;
 constexpr int64_t kEncoderFrames = 1500;
 constexpr int64_t kHiddenSize = 768;
 constexpr int64_t kDecoderStartToken = 50258;
 constexpr int64_t kEosToken = 50257;
+
+//! Whisper's forced decoder prompt. Feeding all four in one prefill both pins
+//! language/task (greedy decoding is free to drift otherwise) and collapses
+//! three decode steps into one.
+constexpr int64_t kLanguageEnToken = 50259;
+constexpr int64_t kTranscribeToken = 50359;
+constexpr int64_t kNoTimestampsToken = 50363;
+
+constexpr int64_t kPromptTokens[]
+    = {kDecoderStartToken, kLanguageEnToken, kTranscribeToken, kNoTimestampsToken};
+
+constexpr int32_t kPromptLength
+    = static_cast<int32_t>(sizeof(kPromptTokens) / sizeof(kPromptTokens[0]));
 constexpr int64_t kMaxDecoderLength = 448;
 
 constexpr int64_t kDecoderLayers = 12;
@@ -113,6 +131,19 @@ void setInputShapeIfDynamic(
     }
 }
 
+nvinfer1::Dims makeSelfCacheShape() noexcept
+{
+    nvinfer1::Dims shape{};
+    shape.nbDims = 6;
+    shape.d[0] = static_cast<int32_t>(kDecoderLayers);
+    shape.d[1] = static_cast<int32_t>(kKeyValueCount);
+    shape.d[2] = static_cast<int32_t>(kBatch);
+    shape.d[3] = static_cast<int32_t>(kAttentionHeads);
+    shape.d[4] = static_cast<int32_t>(kMaxDecoderLength);
+    shape.d[5] = static_cast<int32_t>(kHeadDimension);
+    return shape;
+}
+
 nvinfer1::Dims makeCrossCacheShape() noexcept
 {
     nvinfer1::Dims shape{};
@@ -165,14 +196,44 @@ WhisperDecoderRunner::~WhisperDecoderRunner()
         cudaFree(mLogitsDevice);
     }
 
-    if (mPastKeyValuesDevice)
+    if (mCachePositionDevice)
     {
-        cudaFree(mPastKeyValuesDevice);
+        cudaFree(mCachePositionDevice);
     }
 
-    if (mPresentKeyValuesDevice)
+    if (mSelfKeyValuesDevice)
     {
-        cudaFree(mPresentKeyValuesDevice);
+        cudaFree(mSelfKeyValuesDevice);
+    }
+
+    if (mInputIdsHost)
+    {
+        cudaFreeHost(mInputIdsHost);
+    }
+
+    if (mPositionIdsHost)
+    {
+        cudaFreeHost(mPositionIdsHost);
+    }
+
+    if (mCachePositionHost)
+    {
+        cudaFreeHost(mCachePositionHost);
+    }
+
+    if (mLogitsHost)
+    {
+        cudaFreeHost(mLogitsHost);
+    }
+
+    if (mDecodeGraphExec)
+    {
+        cudaGraphExecDestroy(mDecodeGraphExec);
+    }
+
+    if (mDecodeGraph)
+    {
+        cudaGraphDestroy(mDecodeGraph);
     }
 
     if (mStream)
@@ -291,6 +352,18 @@ bool WhisperDecoderRunner::initialize()
             throw std::runtime_error(
                 "Decoder engine is missing input tensor: "
                 + std::string(kCrossKeyValues));
+        }
+
+        if (!isEngineInput(
+                *mDecoderEngine,
+                kCachePosition))
+        {
+            throw std::runtime_error(
+                "Decoder engine is missing input tensor: "
+                + std::string(kCachePosition)
+                + ". This runner requires a fixed-capacity KV cache engine "
+                  "(past_key_values statically shaped with a cache_position "
+                  "scatter index); a growing-concat engine will not work.");
         }
 
         if (!engineHasOutputTensor(
@@ -474,6 +547,33 @@ bool WhisperDecoderRunner::initialize()
             decoderCrossShape,
             "decoder cross_key_values input");
 
+        // The self cache must be fully static: that is what lets past and
+        // present share one allocation and keeps the decode step capturable.
+        auto const selfCacheShape
+            = mDecoderEngine->getTensorShape(kPastKeyValues);
+
+        nvinfer1::Dims const expectedSelfShape
+            = makeSelfCacheShape();
+
+        if (selfCacheShape.nbDims != expectedSelfShape.nbDims)
+        {
+            throw std::runtime_error(
+                "Unexpected past_key_values rank: "
+                + dimsToString(selfCacheShape));
+        }
+
+        for (int32_t i = 0; i < expectedSelfShape.nbDims; ++i)
+        {
+            if (selfCacheShape.d[i] != expectedSelfShape.d[i])
+            {
+                throw std::runtime_error(
+                    "past_key_values must be statically shaped "
+                    + dimsToString(expectedSelfShape)
+                    + ", got "
+                    + dimsToString(selfCacheShape));
+            }
+        }
+
         // ------------------------------------------------------------
         // Read vocabulary size
         // ------------------------------------------------------------
@@ -601,6 +701,11 @@ bool WhisperDecoderRunner::initialize()
             = kMaxCacheElements
             * cacheElementSize;
 
+        std::size_t const cachePositionBytes
+            = static_cast<std::size_t>(
+                  kMaxDecoderLength)
+            * sizeof(int64_t);
+
         // ------------------------------------------------------------
         // Allocate device buffers
         // ------------------------------------------------------------
@@ -637,31 +742,48 @@ bool WhisperDecoderRunner::initialize()
 
         checkCuda(
             cudaMalloc(
-                &mPastKeyValuesDevice,
-                selfCacheBytes),
-            "allocate past_key_values");
+                &mCachePositionDevice,
+                cachePositionBytes),
+            "allocate cache_position");
 
         checkCuda(
             cudaMalloc(
-                &mPresentKeyValuesDevice,
+                &mSelfKeyValuesDevice,
                 selfCacheBytes),
-            "allocate present_key_values");
+            "allocate self-attention cache");
 
         checkCuda(
             cudaMemsetAsync(
-                mPastKeyValuesDevice,
+                mSelfKeyValuesDevice,
                 0,
                 selfCacheBytes,
                 mStream),
-            "clear past_key_values");
+            "clear self-attention cache");
 
         checkCuda(
-            cudaMemsetAsync(
-                mPresentKeyValuesDevice,
-                0,
-                selfCacheBytes,
-                mStream),
-            "clear present_key_values");
+            cudaMallocHost(
+                reinterpret_cast<void**>(&mInputIdsHost),
+                cachePositionBytes),
+            "allocate pinned input_ids staging");
+
+        checkCuda(
+            cudaMallocHost(
+                reinterpret_cast<void**>(&mPositionIdsHost),
+                cachePositionBytes),
+            "allocate pinned position_ids staging");
+
+        checkCuda(
+            cudaMallocHost(
+                reinterpret_cast<void**>(&mCachePositionHost),
+                cachePositionBytes),
+            "allocate pinned cache_position staging");
+
+        checkCuda(
+            cudaMallocHost(
+                &mLogitsHost,
+                static_cast<std::size_t>(mVocabSize)
+                    * logitsElementSize),
+            "allocate pinned logits staging");
 
         // ------------------------------------------------------------
         // Cross-KV engine bindings
@@ -709,8 +831,19 @@ bool WhisperDecoderRunner::initialize()
         }
 
         if (!mDecoderContext->setTensorAddress(
+                kCachePosition,
+                mCachePositionDevice))
+        {
+            throw std::runtime_error(
+                "Failed to bind decoder cache_position");
+        }
+
+        // Past and present alias one allocation: the scatter writes each step's
+        // K/V into slot `cache_position` and leaves every other slot untouched,
+        // so there is nothing to ping-pong.
+        if (!mDecoderContext->setTensorAddress(
                 kPastKeyValues,
-                mPastKeyValuesDevice))
+                mSelfKeyValuesDevice))
         {
             throw std::runtime_error(
                 "Failed to bind decoder past_key_values");
@@ -734,7 +867,7 @@ bool WhisperDecoderRunner::initialize()
 
         if (!mDecoderContext->setTensorAddress(
                 kPresentKeyValues,
-                mPresentKeyValuesDevice))
+                mSelfKeyValuesDevice))
         {
             throw std::runtime_error(
                 "Failed to bind decoder present_key_values");
@@ -743,6 +876,10 @@ bool WhisperDecoderRunner::initialize()
         checkCuda(
             cudaStreamSynchronize(mStream),
             "initialize decoder buffers");
+
+        // Capture the 1-token decode step now that every binding address is
+        // final. Non-fatal: a failure just leaves every step on enqueueV3.
+        mDecodeGraphReady = captureDecodeGraph();
 
         std::cout
             << "Whisper decoder initialized:\n"
@@ -758,7 +895,14 @@ bool WhisperDecoderRunner::initialize()
             << "  Cross-KV cache: "
             << crossCacheBytes
                 / (1024.0 * 1024.0)
-            << " MiB\n";
+            << " MiB\n"
+            << "  Self-KV cache: "
+            << selfCacheBytes
+                / (1024.0 * 1024.0)
+            << " MiB (fixed, in-place)\n"
+            << "  Decode CUDA graph: "
+            << (mDecodeGraphReady ? "captured" : "unavailable (enqueueV3)")
+            << '\n';
 
         return true;
     }
@@ -772,6 +916,233 @@ bool WhisperDecoderRunner::initialize()
         return false;
     }
 }
+bool WhisperDecoderRunner::captureDecodeGraph()
+{
+    // Escape hatch for bisecting graph-related issues.
+    if (std::getenv("WHISPER_DISABLE_CUDA_GRAPH") != nullptr)
+    {
+        LOG_INFO("WHISPER_DISABLE_CUDA_GRAPH set; using enqueueV3");
+        return false;
+    }
+
+    // Steps 2 + 3: settle the decode-time shapes against the already-bound
+    // addresses. Every binding is fixed for the life of the runner, so one
+    // capture serves every decode step.
+    nvinfer1::Dims2 const tokenShape{static_cast<int32_t>(kBatch), 1};
+
+    nvinfer1::Dims cachePositionShape{};
+    cachePositionShape.nbDims = 1;
+    cachePositionShape.d[0] = 1;
+
+    if (!mDecoderContext->setInputShape(kInputIds, tokenShape)
+        || !mDecoderContext->setInputShape(kPositionIds, tokenShape)
+        || !mDecoderContext->setInputShape(kCachePosition, cachePositionShape))
+    {
+        LOG_WARNING("Could not set 1-token decode shapes; CUDA graph disabled");
+        return false;
+    }
+
+    // Step 4: warm up so TRT finishes any lazy setup before capture.
+    if (!mDecoderContext->enqueueV3(mStream))
+    {
+        LOG_WARNING("Warmup enqueueV3 failed; CUDA graph disabled");
+        return false;
+    }
+
+    if (cudaStreamSynchronize(mStream) != cudaSuccess)
+    {
+        LOG_WARNING("Warmup synchronize failed; CUDA graph disabled");
+        return false;
+    }
+
+    // Capture the whole 1-token step: the three scalar H2D copies, the
+    // enqueue, and the logits readback. Replay then costs a single
+    // cudaGraphLaunch instead of five separate submissions.
+    //
+    // This is wider than rt::EngineExecutor::captureGraph(), which captures
+    // enqueueV3 alone. The failure handling below mirrors captureTRTCudaGraph():
+    // end any in-flight capture and clear the error state so the caller can
+    // fall back to enqueueV3 on a healthy stream.
+    cudaGraph_t graph{nullptr};
+
+    if (cudaStreamBeginCapture(mStream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+    {
+        LOG_WARNING("cudaStreamBeginCapture failed; CUDA graph disabled");
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+
+    bool captureOk = true;
+
+    captureOk = captureOk
+        && cudaMemcpyAsync(mInputIdsDevice, mInputIdsHost, sizeof(int64_t),
+               cudaMemcpyHostToDevice, mStream)
+            == cudaSuccess;
+
+    captureOk = captureOk
+        && cudaMemcpyAsync(mPositionIdsDevice, mPositionIdsHost, sizeof(int64_t),
+               cudaMemcpyHostToDevice, mStream)
+            == cudaSuccess;
+
+    captureOk = captureOk
+        && cudaMemcpyAsync(mCachePositionDevice, mCachePositionHost, sizeof(int64_t),
+               cudaMemcpyHostToDevice, mStream)
+            == cudaSuccess;
+
+    captureOk = captureOk && mDecoderContext->enqueueV3(mStream);
+
+    // Single-token step, so the only logits row is at offset zero.
+    captureOk = captureOk
+        && cudaMemcpyAsync(mLogitsHost, mLogitsDevice, logitsRowBytes(),
+               cudaMemcpyDeviceToHost, mStream)
+            == cudaSuccess;
+
+    if (cudaStreamEndCapture(mStream, &graph) != cudaSuccess || !captureOk)
+    {
+        LOG_WARNING("CUDA graph capture failed; falling back to enqueueV3");
+        static_cast<void>(cudaGetLastError());
+
+        cudaStreamCaptureStatus streamStatus{};
+        if (cudaStreamIsCapturing(mStream, &streamStatus) == cudaSuccess
+            && streamStatus != cudaStreamCaptureStatusNone)
+        {
+            static_cast<void>(cudaStreamEndCapture(mStream, &graph));
+            static_cast<void>(cudaGetLastError());
+        }
+
+        if (graph != nullptr)
+        {
+            static_cast<void>(cudaGraphDestroy(graph));
+        }
+
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+
+    if (instantiateCudaGraph(&mDecodeGraphExec, graph) != cudaSuccess)
+    {
+        LOG_WARNING("cudaGraphInstantiate failed; falling back to enqueueV3");
+        static_cast<void>(cudaGraphDestroy(graph));
+        static_cast<void>(cudaGetLastError());
+        mDecodeGraphExec = nullptr;
+        return false;
+    }
+
+    mDecodeGraph = graph;
+
+    // The warmup wrote a garbage K/V entry into slot 0; generate() clears the
+    // cache before every utterance, so nothing survives into real decoding.
+    return true;
+}
+
+std::size_t WhisperDecoderRunner::logitsRowBytes() const noexcept
+{
+    std::size_t const elementSize
+        = mLogitsType == nvinfer1::DataType::kHALF ? sizeof(__half) : sizeof(float);
+
+    return static_cast<std::size_t>(mVocabSize) * elementSize;
+}
+
+std::size_t WhisperDecoderRunner::cacheElementSize() const noexcept
+{
+    return mCacheType == nvinfer1::DataType::kHALF
+        ? sizeof(__half)
+        : sizeof(float);
+}
+
+int64_t WhisperDecoderRunner::runDecoderStep(
+    int64_t const* tokens,
+    int32_t count)
+{
+    // The captured graph bakes in the 1-token shapes, so shapes only need
+    // setting on the prefill path (or when no graph was captured).
+    bool const useGraph = (count == 1) && mDecodeGraphReady;
+
+    if (!useGraph)
+    {
+        // input_ids / position_ids / cache_position are the only dynamic
+        // inputs. The self cache is statically shaped, so its binding never
+        // changes.
+        nvinfer1::Dims2 const tokenShape{
+            static_cast<int32_t>(kBatch),
+            count};
+
+        nvinfer1::Dims cachePositionShape{};
+        cachePositionShape.nbDims = 1;
+        cachePositionShape.d[0] = count;
+
+        if (!mDecoderContext->setInputShape(kInputIds, tokenShape)
+            || !mDecoderContext->setInputShape(kPositionIds, tokenShape)
+            || !mDecoderContext->setInputShape(kCachePosition, cachePositionShape))
+        {
+            throw std::runtime_error(
+                "Failed setting decoder input shapes");
+        }
+    }
+
+    for (int32_t i = 0; i < count; ++i)
+    {
+        mInputIdsHost[i] = tokens[i];
+        mPositionIdsHost[i] = mCacheLength + i;
+        mCachePositionHost[i] = mCacheLength + i;
+    }
+
+    if (useGraph)
+    {
+        // The graph already contains the scalar H2D copies, the enqueue and the
+        // logits D2H; the pinned buffers written above are its inputs.
+        checkCuda(
+            cudaGraphLaunch(mDecodeGraphExec, mStream),
+            "launch decode CUDA graph");
+
+        checkCuda(cudaStreamSynchronize(mStream), "synchronize decoder stream");
+    }
+    else
+    {
+        std::size_t const idBytes
+            = static_cast<std::size_t>(count) * sizeof(int64_t);
+
+        checkCuda(cudaMemcpyAsync(mInputIdsDevice, mInputIdsHost, idBytes,
+                      cudaMemcpyHostToDevice, mStream),
+            "copy input_ids");
+        checkCuda(cudaMemcpyAsync(mPositionIdsDevice, mPositionIdsHost, idBytes,
+                      cudaMemcpyHostToDevice, mStream),
+            "copy position_ids");
+        checkCuda(cudaMemcpyAsync(mCachePositionDevice, mCachePositionHost, idBytes,
+                      cudaMemcpyHostToDevice, mStream),
+            "copy cache_position");
+
+        if (!mDecoderContext->enqueueV3(mStream))
+        {
+            throw std::runtime_error("Decoder enqueueV3 failed");
+        }
+
+        // Only the last position's logits drive the next token.
+        auto const* lastRow = static_cast<char const*>(mLogitsDevice)
+            + static_cast<std::size_t>(count - 1) * logitsRowBytes();
+
+        checkCuda(cudaMemcpyAsync(mLogitsHost, lastRow, logitsRowBytes(),
+                      cudaMemcpyDeviceToHost, mStream),
+            "copy logits");
+        checkCuda(cudaStreamSynchronize(mStream), "synchronize decoder stream");
+    }
+
+    mCacheLength += count;
+
+    if (mLogitsType == nvinfer1::DataType::kHALF)
+    {
+        auto const* logits = static_cast<__half const*>(mLogitsHost);
+        auto const* best = std::max_element(logits, logits + mVocabSize,
+            [](__half left, __half right)
+            { return __half2float(left) < __half2float(right); });
+        return std::distance(logits, best);
+    }
+
+    auto const* logits = static_cast<float const*>(mLogitsHost);
+    auto const* best = std::max_element(logits, logits + mVocabSize);
+    return std::distance(logits, best);
+}
+
 bool WhisperDecoderRunner::generate(
     std::vector<__half> const& encoderHiddenStates,
     std::vector<int64_t>& outputTokens,
@@ -847,271 +1218,54 @@ bool WhisperDecoderRunner::generate(
             crossCacheShape);
 
         outputTokens.clear();
+        mCacheLength = 0;
 
-        // First input is Whisper's decoder start token.
-        int64_t currentToken = kDecoderStartToken;
+        checkCuda(
+            cudaMemsetAsync(
+                mSelfKeyValuesDevice,
+                0,
+                kMaxCacheElements * cacheElementSize(),
+                mStream),
+            "reset self-attention cache");
 
-        // Number of tokens already stored in the cache.
-        int64_t pastLength = 0;
+        // ----------------------------------------------------
+        // Prefill: the whole forced prompt in one pass.
+        //
+        //   input_ids     [1, 4] = <|sot|> <|en|> <|transcribe|> <|notimestamps|>
+        //   position_ids  [1, 4] = 0 1 2 3
+        //   cache_position   [4] = 0 1 2 3
+        //
+        // Decode then continues one token at a time from slot 4.
+        // ----------------------------------------------------
 
-        for (int32_t step = 0;
+        int64_t nextToken = runDecoderStep(
+            kPromptTokens,
+            kPromptLength);
+
+        outputTokens.push_back(nextToken);
+
+        for (int32_t step = 1;
              step < maxNewTokens;
              ++step)
         {
-            if (pastLength >= kMaxDecoderLength)
-            {
-                break;
-            }
-
-            // Every cached decoding step processes one token.
-            nvinfer1::Dims2 tokenShape{1, 1};
-            nvinfer1::Dims2 positionShape{1, 1};
-
-            // Cache:
-            // [layers, K/V, batch, heads, past_length, head_dim]
-            nvinfer1::Dims pastCacheShape{};
-            pastCacheShape.nbDims = 6;
-            pastCacheShape.d[0]
-                = static_cast<int32_t>(kDecoderLayers);
-            pastCacheShape.d[1]
-                = static_cast<int32_t>(kKeyValueCount);
-            pastCacheShape.d[2]
-                = static_cast<int32_t>(kBatch);
-            pastCacheShape.d[3]
-                = static_cast<int32_t>(kAttentionHeads);
-            pastCacheShape.d[4]
-                = static_cast<int32_t>(pastLength);
-            pastCacheShape.d[5]
-                = static_cast<int32_t>(kHeadDimension);
-
-            if (!mDecoderContext->setInputShape(
-                    kInputIds,
-                    tokenShape))
-            {
-                throw std::runtime_error(
-                    "Failed setting input_ids shape.");
-            }
-
-            if (!mDecoderContext->setInputShape(
-                    kPositionIds,
-                    positionShape))
-            {
-                throw std::runtime_error(
-                    "Failed setting position_ids shape.");
-            }
-
-            if (!mDecoderContext->setInputShape(
-                    kPastKeyValues,
-                    pastCacheShape))
-            {
-                throw std::runtime_error(
-                    "Failed setting past cache shape.");
-            }
-
-            // ------------------------------------------------
-            // Copy the current token
-            // ------------------------------------------------
-
-            if (mInputIdsType
-                == nvinfer1::DataType::kINT64)
-            {
-                checkCuda(
-                    cudaMemcpyAsync(
-                        mInputIdsDevice,
-                        &currentToken,
-                        sizeof(int64_t),
-                        cudaMemcpyHostToDevice,
-                        mStream),
-                    "copy INT64 input token");
-            }
-            else
-            {
-                int32_t const token32
-                    = static_cast<int32_t>(currentToken);
-
-                checkCuda(
-                    cudaMemcpyAsync(
-                        mInputIdsDevice,
-                        &token32,
-                        sizeof(int32_t),
-                        cudaMemcpyHostToDevice,
-                        mStream),
-                    "copy INT32 input token");
-            }
-
-            // Position equals the number of cached tokens.
-            if (mPositionIdsType
-                == nvinfer1::DataType::kINT64)
-            {
-                int64_t const position = pastLength;
-
-                checkCuda(
-                    cudaMemcpyAsync(
-                        mPositionIdsDevice,
-                        &position,
-                        sizeof(int64_t),
-                        cudaMemcpyHostToDevice,
-                        mStream),
-                    "copy INT64 position_id");
-            }
-            else
-            {
-                int32_t const position
-                    = static_cast<int32_t>(pastLength);
-
-                checkCuda(
-                    cudaMemcpyAsync(
-                        mPositionIdsDevice,
-                        &position,
-                        sizeof(int32_t),
-                        cudaMemcpyHostToDevice,
-                        mStream),
-                    "copy INT32 position_id");
-            }
-
-            // Cache addresses change whenever the two cache
-            // buffers are swapped.
-            if (!mDecoderContext->setTensorAddress(
-                    kPastKeyValues,
-                    mPastKeyValuesDevice))
-            {
-                throw std::runtime_error(
-                    "Failed binding past cache.");
-            }
-
-            if (!mDecoderContext->setTensorAddress(
-                    kPresentKeyValues,
-                    mPresentKeyValuesDevice))
-            {
-                throw std::runtime_error(
-                    "Failed binding present cache.");
-            }
-
-            // ------------------------------------------------
-            // Validate runtime output shapes
-            // ------------------------------------------------
-
-            auto const logitsShape
-                = mDecoderContext->getTensorShape(kLogits);
-
-            if (logitsShape.nbDims != 3
-                || logitsShape.d[0] != 1
-                || logitsShape.d[1] != 1
-                || logitsShape.d[2] != mVocabSize)
-            {
-                throw std::runtime_error(
-                    "Unexpected logits shape: "
-                    + dimsToString(logitsShape));
-            }
-
-            auto const presentCacheShape
-                = mDecoderContext->getTensorShape(
-                    kPresentKeyValues);
-
-            if (presentCacheShape.nbDims != 6
-                || presentCacheShape.d[4]
-                    != pastLength + 1)
-            {
-                throw std::runtime_error(
-                    "Unexpected present cache shape: "
-                    + dimsToString(presentCacheShape));
-            }
-
-            // ------------------------------------------------
-            // Run TensorRT decoder
-            // ------------------------------------------------
-
-            if (!mDecoderContext->enqueueV3(mStream))
-            {
-                throw std::runtime_error(
-                    "Decoder enqueueV3 failed.");
-            }
-
-            int64_t nextToken{-1};
-
-            // Only one token was processed, so logits begin
-            // at offset zero.
-            if (mLogitsType
-                == nvinfer1::DataType::kHALF)
-            {
-                std::vector<__half> hostLogits(
-                    static_cast<std::size_t>(mVocabSize));
-
-                checkCuda(
-                    cudaMemcpyAsync(
-                        hostLogits.data(),
-                        mLogitsDevice,
-                        hostLogits.size() * sizeof(__half),
-                        cudaMemcpyDeviceToHost,
-                        mStream),
-                    "copy FP16 logits");
-
-                checkCuda(
-                    cudaStreamSynchronize(mStream),
-                    "synchronize decoder stream");
-
-                auto const maximum
-                    = std::max_element(
-                        hostLogits.begin(),
-                        hostLogits.end(),
-                        [](__half left, __half right)
-                        {
-                            return __half2float(left)
-                                < __half2float(right);
-                        });
-
-                nextToken = std::distance(
-                    hostLogits.begin(),
-                    maximum);
-            }
-            else
-            {
-                std::vector<float> hostLogits(
-                    static_cast<std::size_t>(mVocabSize));
-
-                checkCuda(
-                    cudaMemcpyAsync(
-                        hostLogits.data(),
-                        mLogitsDevice,
-                        hostLogits.size() * sizeof(float),
-                        cudaMemcpyDeviceToHost,
-                        mStream),
-                    "copy FP32 logits");
-
-                checkCuda(
-                    cudaStreamSynchronize(mStream),
-                    "synchronize decoder stream");
-
-                auto const maximum
-                    = std::max_element(
-                        hostLogits.begin(),
-                        hostLogits.end());
-
-                nextToken = std::distance(
-                    hostLogits.begin(),
-                    maximum);
-            }
-
-            // present_key_values now contains:
-            // old cache + current token's K/V.
-            //
-            // Swap it into the past-cache position so it
-            // becomes the input on the next iteration.
-            std::swap(
-                mPastKeyValuesDevice,
-                mPresentKeyValuesDevice);
-
-            ++pastLength;
-
-            
-
             if (nextToken == kEosToken)
             {
                 std::cout << "EOS reached.\n";
                 break;
             }
+
+            if (mCacheLength >= kMaxDecoderLength)
+            {
+                std::cout
+                    << "Cache capacity reached.\n";
+                break;
+            }
+
+            nextToken = runDecoderStep(
+                &nextToken,
+                1);
+
             outputTokens.push_back(nextToken);
-            currentToken = nextToken;
         }
 
         return true;

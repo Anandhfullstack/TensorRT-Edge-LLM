@@ -136,5 +136,30 @@ target_include_directories(
 add_cross_build_link_options(
   whisper_runtime)
 
+# cpp-httplib needs only pthreads; the core libraries do not pull it in.
+find_package(Threads REQUIRED)
 
-  
+add_executable(
+  whisper_server
+  whisper_server.cpp
+  whisper_audio_processor.cpp
+  whisper_chunking.cpp
+  whisper_encoder_inference.cpp
+  whisper_decoder_runner.cpp)
+
+target_link_libraries(
+  whisper_server
+  PRIVATE
+    edgellmCore
+    commonLibraryExt
+    Threads::Threads)
+
+target_include_directories(
+  whisper_server
+  PRIVATE
+    ${COMMON_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/3rdParty/httplib
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_cross_build_link_options(
+  whisper_server)

@@ -22,3 +22,9 @@ target_link_libraries(benchLoggerTest PRIVATE gtest gtest_main exampleUtils
 add_cross_build_link_options(benchLoggerTest)
 
 add_test(NAME benchLoggerTest COMMAND benchLoggerTest)
+
+# whisperChunkingTest covers the long-audio windowing and text stitching, which
+# live with the Whisper example rather than in a core library. Pure logic, no
+# CUDA or TensorRT, so it runs on any machine.
+target_sources(unitTest
+               PRIVATE ${CMAKE_SOURCE_DIR}/examples/multimodal/whisper_chunking.cpp)

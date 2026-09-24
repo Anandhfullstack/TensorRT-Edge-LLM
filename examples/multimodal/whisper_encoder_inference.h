@@ -68,6 +68,13 @@ public:
 
     explicit WhisperEncoderInference(
         std::string enginePath);
+
+    //! Share an already-deserialized engine. Every slot in a server pool then
+    //! gets its own execution context and buffers over one copy of the weights,
+    //! instead of deserializing ~171 MiB per slot.
+    WhisperEncoderInference(
+        std::shared_ptr<nvinfer1::IRuntime> runtime,
+        std::shared_ptr<nvinfer1::ICudaEngine> engine);
     WhisperEncoderInference(
         std::string enginePath,
         std::string inputPath,
@@ -171,8 +178,11 @@ private:
 
     TensorRTLogger mLogger;
 
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
+    // Runtime and engine may be shared across pipeline slots; the context and
+    // the CUDA resources below are always per-instance. Declared before the
+    // context so the context is destroyed first.
+    std::shared_ptr<nvinfer1::IRuntime> mRuntime;
+    std::shared_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
 
 

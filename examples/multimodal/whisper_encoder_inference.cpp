@@ -1,5 +1,7 @@
 #include "whisper_encoder_inference.h"
 
+#include "common/logger.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -48,6 +50,14 @@ WhisperEncoderInference::WhisperEncoderInference(
 // ============================================================
 // Constructor
 // ============================================================
+
+WhisperEncoderInference::WhisperEncoderInference(
+    std::shared_ptr<nvinfer1::IRuntime> runtime,
+    std::shared_ptr<nvinfer1::ICudaEngine> engine)
+    : mRuntime(std::move(runtime))
+    , mEngine(std::move(engine))
+{
+}
 
 WhisperEncoderInference::WhisperEncoderInference(
     std::string enginePath,
@@ -229,10 +239,7 @@ bool WhisperEncoderInference::initialize()
     }
     catch (std::exception const& error)
     {
-        std::cerr
-            << "\nWhisper encoder initialization failed: "
-            << error.what()
-            << '\n';
+        LOG_ERROR("Whisper encoder initialization failed: %s", error.what());
 
         return false;
     }
@@ -259,12 +266,7 @@ bool WhisperEncoderInference::run(
 
     if (inputFeatures.size() != kInputElements)
     {
-        std::cerr
-            << "Invalid Whisper input size. Expected "
-            << kInputElements
-            << ", got "
-            << inputFeatures.size()
-            << '\n';
+        LOG_ERROR("Invalid Whisper input size: expected %zu, got %zu", kInputElements, inputFeatures.size());
 
         return false;
     }
@@ -286,10 +288,7 @@ bool WhisperEncoderInference::run(
 
     if (status != cudaSuccess)
     {
-        std::cerr
-            << "Failed to copy Whisper input to GPU: "
-            << cudaGetErrorString(status)
-            << '\n';
+        LOG_ERROR("Failed to copy Whisper input to GPU: %s", cudaGetErrorString(status));
 
         return false;
     }
@@ -304,8 +303,7 @@ bool WhisperEncoderInference::run(
     if (!mContext->enqueueV3(
             mStream))
     {
-        std::cerr
-            << "TensorRT Whisper encoder execution failed\n";
+        LOG_ERROR("TensorRT Whisper encoder execution failed");
 
         return false;
     }
@@ -326,10 +324,7 @@ bool WhisperEncoderInference::run(
 
     if (status != cudaSuccess)
     {
-        std::cerr
-            << "Failed to copy Whisper encoder output: "
-            << cudaGetErrorString(status)
-            << '\n';
+        LOG_ERROR("Failed to copy Whisper encoder output: %s", cudaGetErrorString(status));
 
         return false;
     }
@@ -343,10 +338,7 @@ bool WhisperEncoderInference::run(
 
     if (status != cudaSuccess)
     {
-        std::cerr
-            << "CUDA stream synchronization failed: "
-            << cudaGetErrorString(status)
-            << '\n';
+        LOG_ERROR("CUDA stream synchronization failed: %s", cudaGetErrorString(status));
 
         return false;
     }
@@ -509,38 +501,39 @@ void WhisperEncoderInference::loadValidationData()
 
 void WhisperEncoderInference::loadEngine()
 {
-    std::cout
-        << "\n================================\n"
-        << " Loading TensorRT engine\n"
-        << "================================\n";
-
-    std::vector<char> engineData
-        = readBinaryFile(
-            mEnginePath);
-
-
-    mRuntime.reset(
-        nvinfer1::createInferRuntime(
-            mLogger));
-
-
-    if (!mRuntime)
-    {
-        throw std::runtime_error(
-            "Failed to create TensorRT runtime.");
-    }
-
-
-    mEngine.reset(
-        mRuntime->deserializeCudaEngine(
-            engineData.data(),
-            engineData.size()));
-
-
+    // A shared engine was injected by the caller; only the per-instance
+    // execution context is still missing.
     if (!mEngine)
     {
-        throw std::runtime_error(
-            "Failed to deserialize TensorRT engine.");
+        std::cout
+            << "\n================================\n"
+            << " Loading TensorRT engine\n"
+            << "================================\n";
+
+        std::vector<char> engineData
+            = readBinaryFile(
+                mEnginePath);
+
+        mRuntime.reset(
+            nvinfer1::createInferRuntime(
+                mLogger));
+
+        if (!mRuntime)
+        {
+            throw std::runtime_error(
+                "Failed to create TensorRT runtime.");
+        }
+
+        mEngine.reset(
+            mRuntime->deserializeCudaEngine(
+                engineData.data(),
+                engineData.size()));
+
+        if (!mEngine)
+        {
+            throw std::runtime_error(
+                "Failed to deserialize TensorRT engine.");
+        }
     }
 
 

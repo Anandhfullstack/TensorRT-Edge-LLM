@@ -5,7 +5,9 @@
 #include "common/trtUtils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -53,6 +55,7 @@ constexpr int64_t kPromptTokens[]
 
 constexpr int32_t kPromptLength
     = static_cast<int32_t>(sizeof(kPromptTokens) / sizeof(kPromptTokens[0]));
+static_assert(kPromptLength == kWhisperPromptLength, "forced prompt length must match the header constant");
 constexpr int64_t kMaxDecoderLength = 448;
 
 constexpr int64_t kDecoderLayers = 12;
@@ -169,6 +172,16 @@ WhisperDecoderRunner::WhisperDecoderRunner(
 {
 }
 
+WhisperDecoderRunner::WhisperDecoderRunner(
+    std::shared_ptr<nvinfer1::IRuntime> runtime,
+    std::shared_ptr<nvinfer1::ICudaEngine> crossKvEngine,
+    std::shared_ptr<nvinfer1::ICudaEngine> decoderEngine)
+    : mRuntime(std::move(runtime))
+    , mCrossKvEngine(std::move(crossKvEngine))
+    , mDecoderEngine(std::move(decoderEngine))
+{
+}
+
 WhisperDecoderRunner::~WhisperDecoderRunner()
 {
     if (mInputIdsDevice)
@@ -255,41 +268,42 @@ bool WhisperDecoderRunner::initialize()
         // TensorRT runtime
         // ------------------------------------------------------------
 
-        mRuntime.reset(
-            nvinfer1::createInferRuntime(gLogger));
-
-        if (!mRuntime)
+        // Shared engines injected by the caller; only the per-instance contexts
+        // and buffers below are still missing.
+        if (!mCrossKvEngine || !mDecoderEngine)
         {
-            throw std::runtime_error(
-                "Failed to create TensorRT runtime");
-        }
+            mRuntime.reset(
+                nvinfer1::createInferRuntime(gLogger));
 
-        // ------------------------------------------------------------
-        // Load both engines
-        // ------------------------------------------------------------
+            if (!mRuntime)
+            {
+                throw std::runtime_error(
+                    "Failed to create TensorRT runtime");
+            }
 
-        mCrossKvEngine
-            = deserializeCudaEngineFromFile(
-                *mRuntime,
-                mCrossKvEnginePath);
+            mCrossKvEngine
+                = deserializeCudaEngineFromFile(
+                    *mRuntime,
+                    mCrossKvEnginePath);
 
-        if (!mCrossKvEngine)
-        {
-            throw std::runtime_error(
-                "Failed to load cross-KV engine: "
-                + mCrossKvEnginePath);
-        }
+            if (!mCrossKvEngine)
+            {
+                throw std::runtime_error(
+                    "Failed to load cross-KV engine: "
+                    + mCrossKvEnginePath);
+            }
 
-        mDecoderEngine
-            = deserializeCudaEngineFromFile(
-                *mRuntime,
-                mDecoderEnginePath);
+            mDecoderEngine
+                = deserializeCudaEngineFromFile(
+                    *mRuntime,
+                    mDecoderEnginePath);
 
-        if (!mDecoderEngine)
-        {
-            throw std::runtime_error(
-                "Failed to load decoder engine: "
-                + mDecoderEnginePath);
+            if (!mDecoderEngine)
+            {
+                throw std::runtime_error(
+                    "Failed to load decoder engine: "
+                    + mDecoderEnginePath);
+            }
         }
 
         // ------------------------------------------------------------
@@ -908,10 +922,7 @@ bool WhisperDecoderRunner::initialize()
     }
     catch (std::exception const& e)
     {
-        std::cerr
-            << "Decoder initialization failed: "
-            << e.what()
-            << '\n';
+        LOG_ERROR("Decoder initialization failed: %s", e.what());
 
         return false;
     }
@@ -1143,22 +1154,183 @@ int64_t WhisperDecoderRunner::runDecoderStep(
     return std::distance(logits, best);
 }
 
+void WhisperDecoderRunner::loadLogitsScratch()
+{
+    mLogitsScratch.resize(static_cast<std::size_t>(mVocabSize));
+
+    if (mLogitsType == nvinfer1::DataType::kHALF)
+    {
+        auto const* logits = static_cast<__half const*>(mLogitsHost);
+
+        for (int64_t i = 0; i < mVocabSize; ++i)
+        {
+            mLogitsScratch[static_cast<std::size_t>(i)] = __half2float(logits[i]);
+        }
+
+        return;
+    }
+
+    auto const* logits = static_cast<float const*>(mLogitsHost);
+
+    std::copy(logits, logits + mVocabSize, mLogitsScratch.begin());
+}
+
+int64_t WhisperDecoderRunner::selectTokenWithTimestampRules(
+    std::vector<int64_t> const& sampled,
+    bool const atSampleBegin)
+{
+    loadLogitsScratch();
+
+    float* const logits = mLogitsScratch.data();
+
+    constexpr float kSuppressed = -std::numeric_limits<float>::infinity();
+
+    auto const timestampBegin = static_cast<std::size_t>(kWhisperTimestampBeginToken);
+    auto const vocabSize = static_cast<std::size_t>(mVocabSize);
+
+    // Timestamps are on; never let the model ask for them to be off.
+    logits[static_cast<std::size_t>(kNoTimestampsToken)] = kSuppressed;
+
+    bool const lastWasTimestamp
+        = !sampled.empty() && sampled.back() >= kWhisperTimestampBeginToken;
+
+    // OpenAI treats "fewer than two sampled tokens" as penultimate-was-timestamp,
+    // which makes a lone opening timestamp demand text next.
+    bool const penultimateWasTimestamp = sampled.size() < 2
+        || sampled[sampled.size() - 2] >= kWhisperTimestampBeginToken;
+
+    if (lastWasTimestamp)
+    {
+        if (penultimateWasTimestamp)
+        {
+            // A closed pair: text must follow.
+            std::fill(logits + timestampBegin, logits + vocabSize, kSuppressed);
+        }
+        else
+        {
+            // An open pair: only a timestamp or EOT may close it.
+            std::fill(logits, logits + static_cast<std::size_t>(kEosToken), kSuppressed);
+        }
+    }
+
+    // Timestamps must not go backwards.
+    int64_t lastTimestamp = -1;
+
+    for (auto it = sampled.rbegin(); it != sampled.rend(); ++it)
+    {
+        if (*it >= kWhisperTimestampBeginToken)
+        {
+            lastTimestamp = *it;
+            break;
+        }
+    }
+
+    if (lastTimestamp >= 0)
+    {
+        // Re-emitting the same timestamp is allowed only when it closes an open
+        // pair; otherwise the next one must be strictly later.
+        int64_t const floorToken = (lastWasTimestamp && !penultimateWasTimestamp)
+            ? lastTimestamp
+            : lastTimestamp + 1;
+
+        auto const floorIndex
+            = std::min(static_cast<std::size_t>(floorToken), vocabSize);
+
+        std::fill(logits + timestampBegin, logits + floorIndex, kSuppressed);
+    }
+
+    if (atSampleBegin)
+    {
+        // A segment always opens with a timestamp.
+        std::fill(logits, logits + timestampBegin, kSuppressed);
+    }
+
+    // If the total probability mass on timestamps exceeds the best single text
+    // token, emit a timestamp. This is the rule that ends a segment even when
+    // no individual timestamp token is the argmax, and it needs a normalized
+    // log-softmax over the whole row.
+    float maxLogit = kSuppressed;
+
+    for (std::size_t i = 0; i < vocabSize; ++i)
+    {
+        maxLogit = std::max(maxLogit, logits[i]);
+    }
+
+    if (std::isfinite(maxLogit))
+    {
+        double sumExp = 0.0;
+        double timestampExp = 0.0;
+        float maxTextLogit = kSuppressed;
+
+        for (std::size_t i = 0; i < vocabSize; ++i)
+        {
+            if (!std::isfinite(logits[i]))
+            {
+                continue;
+            }
+
+            double const term = std::exp(static_cast<double>(logits[i] - maxLogit));
+
+            sumExp += term;
+
+            if (i >= timestampBegin)
+            {
+                timestampExp += term;
+            }
+            else
+            {
+                maxTextLogit = std::max(maxTextLogit, logits[i]);
+            }
+        }
+
+        if (sumExp > 0.0)
+        {
+            double const logSumExp = std::log(sumExp);
+            double const timestampLogprob
+                = timestampExp > 0.0 ? std::log(timestampExp) - logSumExp
+                                     : -std::numeric_limits<double>::infinity();
+            double const maxTextLogprob = std::isfinite(maxTextLogit)
+                ? static_cast<double>(maxTextLogit - maxLogit) - logSumExp
+                : -std::numeric_limits<double>::infinity();
+
+            if (timestampLogprob > maxTextLogprob)
+            {
+                std::fill(logits, logits + timestampBegin, kSuppressed);
+            }
+        }
+    }
+
+    auto const best = std::max_element(logits, logits + vocabSize);
+
+    return std::distance(logits, best);
+}
+
 bool WhisperDecoderRunner::generate(
     std::vector<__half> const& encoderHiddenStates,
     std::vector<int64_t>& outputTokens,
-    int32_t maxNewTokens)
+    int32_t maxNewTokens,
+    std::vector<int64_t> const* promptTokens,
+    bool emitTimestamps)
 {
     if (!initialize())
     {
         return false;
     }
 
+    if (promptTokens != nullptr
+        && (promptTokens->empty()
+            || promptTokens->size() >= static_cast<std::size_t>(kMaxDecoderLength)))
+    {
+        LOG_ERROR("Forced prompt must hold 1..%ld tokens, got %zu", kMaxDecoderLength - 1,
+            promptTokens->size());
+
+        return false;
+    }
+
     if (encoderHiddenStates.size() != kEncoderElements)
     {
-        std::cerr
-            << "Unexpected encoder output size: "
-            << encoderHiddenStates.size()
-            << '\n';
+        LOG_ERROR("Unexpected encoder output size: %zu (expected %zu)", encoderHiddenStates.size(),
+            kEncoderElements);
 
         return false;
     }
@@ -1238,11 +1410,25 @@ bool WhisperDecoderRunner::generate(
         // Decode then continues one token at a time from slot 4.
         // ----------------------------------------------------
 
-        int64_t nextToken = runDecoderStep(
-            kPromptTokens,
-            kPromptLength);
+        int64_t const* const prefill
+            = promptTokens != nullptr ? promptTokens->data() : kPromptTokens;
+        auto const prefillLength = promptTokens != nullptr
+            ? static_cast<int32_t>(promptTokens->size())
+            : kPromptLength;
+
+        mSampled.clear();
+
+        int64_t nextToken = runDecoderStep(prefill, prefillLength);
+
+        if (emitTimestamps)
+        {
+            // The prefill's argmax was taken before any rule could apply; redo
+            // the selection over the same logits under the rules.
+            nextToken = selectTokenWithTimestampRules(mSampled, true);
+        }
 
         outputTokens.push_back(nextToken);
+        mSampled.push_back(nextToken);
 
         for (int32_t step = 1;
              step < maxNewTokens;
@@ -1250,14 +1436,13 @@ bool WhisperDecoderRunner::generate(
         {
             if (nextToken == kEosToken)
             {
-                std::cout << "EOS reached.\n";
+                LOG_DEBUG("EOS reached after %d tokens", step);
                 break;
             }
 
             if (mCacheLength >= kMaxDecoderLength)
             {
-                std::cout
-                    << "Cache capacity reached.\n";
+                LOG_WARNING("Decoder cache capacity (%ld) reached; stopping early", kMaxDecoderLength);
                 break;
             }
 
@@ -1265,17 +1450,20 @@ bool WhisperDecoderRunner::generate(
                 &nextToken,
                 1);
 
+            if (emitTimestamps)
+            {
+                nextToken = selectTokenWithTimestampRules(mSampled, false);
+            }
+
             outputTokens.push_back(nextToken);
+            mSampled.push_back(nextToken);
         }
 
         return true;
     }
     catch (std::exception const& error)
     {
-        std::cerr
-            << "Decoder generation failed: "
-            << error.what()
-            << '\n';
+        LOG_ERROR("Decoder generation failed: %s", error.what());
 
         return false;
     }

@@ -28,7 +28,8 @@ import concurrent.futures
 import subprocess
 import time
 
-from harness import CheckResult, WhisperServer, get, transcribe, transcribe_no_file
+from harness import (CheckResult, WhisperServer, get, transcribe,
+                     transcribe_no_file)
 
 # Checks are registered here; run_tests.sh --list prints this table.
 REGISTRY = {}
@@ -69,20 +70,28 @@ def check_smoke(config, fixtures):
             problems.append(f"/health slots={health.get('slots')}, expected 2")
 
         if models.status != 200 or "whisper" not in models.body:
-            problems.append(f"/v1/models returned {models.status}: {models.body[:120]}")
+            problems.append(
+                f"/v1/models returned {models.status}: {models.body[:120]}")
 
-        return CheckResult("smoke", not problems,
-                           "endpoints healthy" if not problems else "endpoint problems", problems)
+        return CheckResult(
+            "smoke", not problems,
+            "endpoints healthy" if not problems else "endpoint problems",
+            problems)
 
 
-@check("equivalence", "server transcript is byte-identical to the whisper_runtime CLI")
+@check("equivalence",
+       "server transcript is byte-identical to the whisper_runtime CLI")
 def check_equivalence(config, fixtures):
     if not config.runtime_bin:
-        return CheckResult("equivalence", True, "whisper_runtime binary not found", skipped=True)
+        return CheckResult("equivalence",
+                           True,
+                           "whisper_runtime binary not found",
+                           skipped=True)
 
     completed = subprocess.run([
         config.runtime_bin, config.encoder_engine, config.cross_kv_engine,
-        config.decoder_engine, config.tokenizer_dir, config.reference_audio, "128"
+        config.decoder_engine, config.tokenizer_dir, config.reference_audio,
+        "128"
     ],
                                capture_output=True,
                                text=True,
@@ -107,16 +116,20 @@ def check_equivalence(config, fixtures):
     return CheckResult(
         "equivalence", passed,
         "byte-identical" if passed else "server and CLI disagree",
-        [f"CLI   : {cli_text!r}", f"server: {server_text!r}"] if not passed else
-        [f"{len(server_text)} chars: {server_text[:72]!r}"])
+        [f"CLI   : {cli_text!r}", f"server: {server_text!r}"]
+        if not passed else [f"{len(server_text)} chars: {server_text[:72]!r}"])
 
 
-@check("slot_reuse", "a slot returns identical output across sequential requests")
+@check("slot_reuse",
+       "a slot returns identical output across sequential requests")
 def check_slot_reuse(config, fixtures):
     rounds = 20
 
     with WhisperServer(config, slots=1) as server:
-        texts = {transcribe(server.port, config.reference_audio).text for _ in range(rounds)}
+        texts = {
+            transcribe(server.port, config.reference_audio).text
+            for _ in range(rounds)
+        }
 
     passed = len(texts) == 1
 
@@ -126,7 +139,8 @@ def check_slot_reuse(config, fixtures):
         [] if passed else [f"{t!r}" for t in sorted(texts)])
 
 
-@check("slot_isolation", "concurrent slots never return another request's transcript")
+@check("slot_isolation",
+       "concurrent slots never return another request's transcript")
 def check_slot_isolation(config, fixtures):
     slots = max(2, config.slots)
     queue_depth = 16
@@ -136,12 +150,16 @@ def check_slot_isolation(config, fixtures):
 
     with WhisperServer(config, slots=slots, queue_depth=queue_depth) as server:
         # Baselines one at a time, so each is that clip's uncontended answer.
-        baseline = {name: transcribe(server.port, fixtures[name]).text for name in clips}
+        baseline = {
+            name: transcribe(server.port, fixtures[name]).text
+            for name in clips
+        }
 
         if len(set(baseline.values())) != len(clips):
-            return CheckResult("slot_isolation", False,
-                               "fixture clips do not have distinct transcripts",
-                               [f"{k}: {v!r}" for k, v in baseline.items()])
+            return CheckResult(
+                "slot_isolation", False,
+                "fixture clips do not have distinct transcripts",
+                [f"{k}: {v!r}" for k, v in baseline.items()])
 
         jobs = [(lambda n=name: (n, transcribe(server.port, fixtures[n])))
                 for _ in range(rounds) for name in clips]
@@ -156,14 +174,17 @@ def check_slot_isolation(config, fixtures):
             continue
 
         if response.text != baseline[name]:
-            mismatches.append(f"{name}: expected {baseline[name]!r}, got {response.text!r}")
+            mismatches.append(
+                f"{name}: expected {baseline[name]!r}, got {response.text!r}")
 
     passed = not mismatches and shed == 0
 
     detail = mismatches[:5]
 
     if shed:
-        detail.append(f"{shed} request(s) shed with 503 - lower in-flight or raise queue depth")
+        detail.append(
+            f"{shed} request(s) shed with 503 - lower in-flight or raise queue depth"
+        )
 
     return CheckResult(
         "slot_isolation", passed,
@@ -171,13 +192,17 @@ def check_slot_isolation(config, fixtures):
         f"{in_flight} in flight", detail)
 
 
-@check("input_rejection", "bad, empty and over-long uploads are refused with the right status")
+@check("input_rejection",
+       "bad, empty and over-long uploads are refused with the right status")
 def check_input_rejection(config, fixtures):
     with WhisperServer(config, slots=1) as server:
         cases = [
-            ("missing 'file' field", 400, lambda: transcribe_no_file(server.port, model="x")),
-            ("empty file", 400, lambda: transcribe(server.port, fixtures["empty"])),
-            ("undecodable bytes", 400, lambda: transcribe(server.port, fixtures["garbage"])),
+            ("missing 'file' field", 400,
+             lambda: transcribe_no_file(server.port, model="x")),
+            ("empty file", 400,
+             lambda: transcribe(server.port, fixtures["empty"])),
+            ("undecodable bytes", 400,
+             lambda: transcribe(server.port, fixtures["garbage"])),
             # Since long-audio support, exceeding one window is transcribed
             # across several windows rather than refused.
             ("29 s audio (one window)", 200,
@@ -187,12 +212,12 @@ def check_input_rejection(config, fixtures):
             # Past the shared loader's decode cap it cannot be buffered at all.
             ("601 s audio (past the decode cap)", 400,
              lambda: transcribe(server.port, fixtures["audio_601s"])),
-            ("bad response_format", 400,
-             lambda: transcribe(server.port, config.reference_audio, response_format="srt")),
-            ("unknown language", 400,
-             lambda: transcribe(server.port, config.reference_audio, language="zz")),
-            ("unknown task", 400,
-             lambda: transcribe(server.port, config.reference_audio, task="summarize")),
+            ("bad response_format", 400, lambda: transcribe(
+                server.port, config.reference_audio, response_format="srt")),
+            ("unknown language", 400, lambda: transcribe(
+                server.port, config.reference_audio, language="zz")),
+            ("unknown task", 400, lambda: transcribe(
+                server.port, config.reference_audio, task="summarize")),
         ]
 
         detail = []
@@ -211,20 +236,25 @@ def check_input_rejection(config, fixtures):
 
         if busy != 0:
             failures += 1
-            detail.append(f"busy={busy} after rejections - a refused request held a slot")
+            detail.append(
+                f"busy={busy} after rejections - a refused request held a slot"
+            )
 
     return CheckResult("input_rejection", failures == 0,
-                       f"{len(cases) - failures}/{len(cases)} cases correct", detail)
+                       f"{len(cases) - failures}/{len(cases)} cases correct",
+                       detail)
 
 
-@check("backpressure", "load beyond the queue is shed with 503 + Retry-After, not queued")
+@check("backpressure",
+       "load beyond the queue is shed with 503 + Retry-After, not queued")
 def check_backpressure(config, fixtures):
     slots = config.slots
     queue_depth = max(slots, 4)
     flood = queue_depth * 5
 
     with WhisperServer(config, slots=slots, queue_depth=queue_depth) as server:
-        jobs = [(lambda: transcribe(server.port, config.reference_audio)) for _ in range(flood)]
+        jobs = [(lambda: transcribe(server.port, config.reference_audio))
+                for _ in range(flood)]
         responses = _parallel(jobs, flood)
 
         codes = {}
@@ -240,31 +270,40 @@ def check_backpressure(config, fixtures):
     problems = []
 
     if not shed:
-        problems.append(f"nothing shed at queue depth {queue_depth} under {flood} concurrent "
-                        "- is the socket pool larger than the admission cap?")
+        problems.append(
+            f"nothing shed at queue depth {queue_depth} under {flood} concurrent "
+            "- is the socket pool larger than the admission cap?")
 
     if missing_header:
-        problems.append(f"{len(missing_header)} of {len(shed)} 503s lacked Retry-After")
+        problems.append(
+            f"{len(missing_header)} of {len(shed)} 503s lacked Retry-After")
 
     if set(codes) - {200, 503}:
-        problems.append(f"unexpected status codes: {sorted(set(codes) - {200, 503})}")
+        problems.append(
+            f"unexpected status codes: {sorted(set(codes) - {200, 503})}")
 
     if recovered != 0:
         problems.append(f"busy={recovered} after the flood drained")
 
-    return CheckResult("backpressure", not problems,
-                       f"{flood} concurrent at depth {queue_depth} -> " +
-                       ", ".join(f"{n}x {c}" for c, n in sorted(codes.items())), problems)
+    return CheckResult(
+        "backpressure", not problems,
+        f"{flood} concurrent at depth {queue_depth} -> " +
+        ", ".join(f"{n}x {c}" for c, n in sorted(codes.items())), problems)
 
 
-@check("language_task", "language and task change the forced prompt and are validated")
+@check("language_task",
+       "language and task change the forced prompt and are validated")
 def check_language_task(config, fixtures):
     with WhisperServer(config, slots=1) as server:
         default = transcribe(server.port, config.reference_audio).text
-        english = transcribe(server.port, config.reference_audio, language="en").text
+        english = transcribe(server.port,
+                             config.reference_audio,
+                             language="en").text
         upper = transcribe(server.port, config.reference_audio, language="EN")
-        german = transcribe(server.port, config.reference_audio, language="de").text
-        french = transcribe(server.port, config.reference_audio, language="fr").text
+        german = transcribe(server.port, config.reference_audio,
+                            language="de").text
+        french = transcribe(server.port, config.reference_audio,
+                            language="fr").text
         translated = transcribe(server.port,
                                 config.reference_audio,
                                 language="de",
@@ -279,7 +318,8 @@ def check_language_task(config, fixtures):
         problems.append(f"language=EN should case-fold, got {upper.status}")
 
     if german == english:
-        problems.append("language=de produced the English transcript - prompt not applied")
+        problems.append(
+            "language=de produced the English transcript - prompt not applied")
 
     if french == english or french == german:
         problems.append("language=fr did not produce a distinct transcript")
@@ -289,16 +329,153 @@ def check_language_task(config, fixtures):
     if translated == german:
         problems.append("task=translate behaved like transcribe")
 
-    return CheckResult("language_task", not problems,
-                       "en / de / fr / translate all distinct; validation enforced", [
-                           f"en       : {english[:60]!r}",
-                           f"de       : {german[:60]!r}",
-                           f"fr       : {french[:60]!r}",
-                           f"translate: {translated[:60]!r}",
-                       ] if not problems else problems)
+    return CheckResult(
+        "language_task", not problems,
+        "en / de / fr / translate all distinct; validation enforced", [
+            f"en       : {english[:60]!r}",
+            f"de       : {german[:60]!r}",
+            f"fr       : {french[:60]!r}",
+            f"translate: {translated[:60]!r}",
+        ] if not problems else problems)
 
 
-@check("memory_leak", "resident memory plateaus instead of growing per request")
+@check(
+    "hotwords",
+    "hotwords are validated, truncated not refused, and leave plain requests unchanged"
+)
+def check_hotwords(config, fixtures):
+    """Hotword context rides in the <|startofprev|> slot (HOTWORD.md). This proves
+    the plumbing and the guards; the accuracy gain is measured separately by
+    STUDY_HOTWORD/eval_server.py, since no single clip guarantees a change."""
+    hotwords = "TensorRT, Jetson Orin, Edge-LLM, Whisper"
+    long_list = ", ".join(f"Term{i}"
+                          for i in range(400))  # far past the 223-token budget
+
+    with WhisperServer(config, slots=1) as server:
+        baseline = transcribe(server.port, config.reference_audio)
+        cases = [
+            ("empty hotwords == no hotwords", 200, baseline.text, lambda:
+             transcribe(server.port, config.reference_audio, hotwords="")),
+            ("separators only == no hotwords", 200, baseline.text,
+             lambda: transcribe(
+                 server.port, config.reference_audio, hotwords=" , ,, ")),
+            ("valid hotwords", 200, None, lambda: transcribe(
+                server.port, config.reference_audio, hotwords=hotwords)),
+            ("over-budget list is truncated", 200, None, lambda: transcribe(
+                server.port, config.reference_audio, hotwords=long_list)),
+            ("<|endoftext|> injection", 400, None,
+             lambda: transcribe(server.port,
+                                config.reference_audio,
+                                hotwords="a, <|endoftext|>")),
+            ("<|fr|> injection", 400, None, lambda: transcribe(
+                server.port, config.reference_audio, hotwords="<|fr|>")),
+            ("<|startoftranscript|> injection", 400, None,
+             lambda: transcribe(server.port,
+                                config.reference_audio,
+                                hotwords="x <|startoftranscript|>")),
+            ("5000-byte hotwords", 413, None, lambda: transcribe(
+                server.port, config.reference_audio, hotwords="a" * 5000)),
+            ("long audio with hotwords", 200, None, lambda: transcribe(
+                server.port, fixtures["speech_45s"], hotwords=hotwords)),
+        ]
+
+        detail = []
+        failures = 0
+
+        for label, expected_status, expected_text, call in cases:
+            result = call()
+            problem = None
+
+            if result.status != expected_status:
+                problem = f"expected {expected_status}, got {result.status}"
+            elif expected_status == 200 and not result.text.strip():
+                problem = "empty transcript"
+            elif expected_text is not None and result.text != expected_text:
+                problem = f"text differs from the no-hotword baseline: {result.text[:60]!r}"
+
+            if problem:
+                failures += 1
+                detail.append(f"{label}: {problem}")
+            else:
+                detail.append(f"{label}: {result.status}")
+
+        # Repeat the baseline last: a hotword request must not leave context behind
+        # in the slot's decoder state.
+        after = transcribe(server.port, config.reference_audio)
+
+        if after.text != baseline.text:
+            failures += 1
+            detail.append(
+                f"plain request after hotword requests changed: {after.text[:60]!r}"
+            )
+
+        busy = server.health()["busy"]
+
+        if busy != 0:
+            failures += 1
+            detail.append(
+                f"busy={busy} after rejections - a refused request held a slot"
+            )
+
+    return CheckResult(
+        "hotwords", failures == 0,
+        f"{len(cases) + 1 - failures}/{len(cases) + 1} cases correct", detail)
+
+
+@check("hotword_isolation",
+       "concurrent requests with different hotword lists never mix contexts")
+def check_hotword_isolation(config, fixtures):
+    """Each request builds its own prompt vectors; a slot must not keep one
+    request's context for the next. Mixes hotword lists and plain requests over
+    distinct clips, all in flight together, against sequential baselines."""
+    slots = max(2, config.slots)
+    queue_depth = 16
+    in_flight = min(12, queue_depth)
+    rounds = 6
+    clips = ["clip_a", "clip_b", "clip_c", "clip_d"]
+    lists = [
+        None, "Kioxia, Tsunakawa, NAND", "Turkcell, Paycell, EBITDA",
+        "Ecopetrol, Bicentenario"
+    ]
+    cases = [(clip, words) for clip in clips for words in lists]
+
+    def call(clip, words):
+        form = {} if words is None else {"hotwords": words}
+        return transcribe(server.port, fixtures[clip], **form)
+
+    with WhisperServer(config, slots=slots, queue_depth=queue_depth) as server:
+        baseline = {case: call(*case).text for case in cases}
+        jobs = [(lambda c=case: (c, call(*c))) for _ in range(rounds)
+                for case in cases]
+        results = _parallel(jobs, in_flight)
+
+    mismatches = []
+    shed = 0
+
+    for case, response in results:
+        if response.status != 200:
+            shed += 1
+            continue
+
+        if response.text != baseline[case]:
+            mismatches.append(
+                f"{case}: expected {baseline[case]!r}, got {response.text!r}")
+
+    detail = mismatches[:5]
+
+    if shed:
+        detail.append(
+            f"{shed} request(s) shed with 503 - lower in-flight or raise queue depth"
+        )
+
+    return CheckResult(
+        "hotword_isolation", not mismatches and shed == 0,
+        f"{len(results) - shed}/{len(results)} correct: {len(clips)} clips x {len(lists)} hotword lists, "
+        f"{in_flight} in flight over {slots} slots", detail)
+
+
+@check("memory_leak",
+       "resident memory plateaus instead of growing per request")
 def check_memory_leak(config, fixtures):
     """Two consecutive windows, and only the second is asserted.
 
@@ -315,9 +492,11 @@ def check_memory_leak(config, fixtures):
     in_flight = min(8, config.slots * 2)
 
     with WhisperServer(config, slots=config.slots, queue_depth=16) as server:
+
         def burst(count):
-            return _parallel([(lambda: transcribe(server.port, fixtures["clip_a"]))
-                              for _ in range(count)], in_flight)
+            return _parallel(
+                [(lambda: transcribe(server.port, fixtures["clip_a"]))
+                 for _ in range(count)], in_flight)
 
         burst(8)
 
@@ -354,7 +533,8 @@ def check_memory_leak(config, fixtures):
         ])
 
 
-@check("long_audio", "audio past one 30 s window is windowed, seeked and joined")
+@check("long_audio",
+       "audio past one 30 s window is windowed, seeked and joined")
 def check_long_audio(config, fixtures):
     """Long clips are decoded window by window, the next window's start taken
     from the last timestamp the model emitted.
@@ -398,32 +578,37 @@ def check_long_audio(config, fixtures):
                         "equivalence with the CLI is no longer guaranteed")
 
     if marker in mid_text or marker in long_text:
-        problems.append("joined output contains an interior end-of-text marker")
+        problems.append(
+            "joined output contains an interior end-of-text marker")
 
     if len(mid_text) <= len(short_text):
-        problems.append(f"45 s produced {len(mid_text)} chars, not more than one window "
-                        f"({len(short_text)}) - windowing may not be running")
+        problems.append(
+            f"45 s produced {len(mid_text)} chars, not more than one window "
+            f"({len(short_text)}) - windowing may not be running")
 
     # The regression that timestamp seeking exists to prevent.
     if len(long_text) <= len(mid_text):
-        problems.append(f"90 s produced {len(long_text)} chars, not more than 45 s "
-                        f"({len(mid_text)}) - speech is being merged away")
+        problems.append(
+            f"90 s produced {len(long_text)} chars, not more than 45 s "
+            f"({len(mid_text)}) - speech is being merged away")
 
     # Elapsed work is content-independent proof that every window decoded.
     ratio = long_elapsed / short_elapsed if short_elapsed > 0 else 0.0
 
     if ratio < 2.0:
-        problems.append(f"90 s took {long_elapsed:.2f} s against {short_elapsed:.2f} s for one "
-                        f"window ({ratio:.1f}x) - later windows may not be decoded")
+        problems.append(
+            f"90 s took {long_elapsed:.2f} s against {short_elapsed:.2f} s for one "
+            f"window ({ratio:.1f}x) - later windows may not be decoded")
 
     return CheckResult(
         "long_audio", not problems,
         f"9.94 s -> {len(short_text)} chars, 45 s -> {len(mid_text)}, "
-        f"90 s -> {len(long_text)} ({ratio:.1f}x work)", problems or
-        [f"45 s: {mid_text[:88]}..."])
+        f"90 s -> {len(long_text)} ({ratio:.1f}x work)", problems
+        or [f"45 s: {mid_text[:88]}..."])
 
 
-@check("long_audio_modes", "timestamp seeking keeps repeated speech that overlap matching drops")
+@check("long_audio_modes",
+       "timestamp seeking keeps repeated speech that overlap matching drops")
 def check_long_audio_modes(config, fixtures):
     """Runs the same repetitive clip through both long-audio strategies.
 
@@ -437,7 +622,9 @@ def check_long_audio_modes(config, fixtures):
     with WhisperServer(config, slots=1, max_new_tokens=220) as server:
         timestamps = transcribe(server.port, clip)
 
-    with WhisperServer(config, slots=1, max_new_tokens=220,
+    with WhisperServer(config,
+                       slots=1,
+                       max_new_tokens=220,
                        extra_args=["--long-audio-mode", "overlap"]) as server:
         overlap = transcribe(server.port, clip)
 
@@ -445,31 +632,41 @@ def check_long_audio_modes(config, fixtures):
 
     for label, response in (("timestamps", timestamps), ("overlap", overlap)):
         if response.status != 200:
-            problems.append(f"{label} mode: expected 200, got {response.status}")
+            problems.append(
+                f"{label} mode: expected 200, got {response.status}")
 
     if problems:
-        return CheckResult("long_audio_modes", False, "a request failed", problems)
+        return CheckResult("long_audio_modes", False, "a request failed",
+                           problems)
 
     ts_len = len(timestamps.text)
     ov_len = len(overlap.text)
 
     if ts_len <= ov_len:
-        problems.append(f"timestamp mode produced {ts_len} chars against overlap's {ov_len} - "
-                        "timestamp seeking should retain strictly more on repetitive speech")
+        problems.append(
+            f"timestamp mode produced {ts_len} chars against overlap's {ov_len} - "
+            "timestamp seeking should retain strictly more on repetitive speech"
+        )
 
-    return CheckResult("long_audio_modes", not problems,
-                       f"90 s repetitive clip: timestamps {ts_len} chars, "
-                       f"overlap {ov_len} chars ({ts_len / max(ov_len, 1):.1f}x)", problems)
+    return CheckResult(
+        "long_audio_modes", not problems,
+        f"90 s repetitive clip: timestamps {ts_len} chars, "
+        f"overlap {ov_len} chars ({ts_len / max(ov_len, 1):.1f}x)", problems)
 
 
-@check("cli_regression", "whisper_runtime still runs and transcribes after server changes")
+@check("cli_regression",
+       "whisper_runtime still runs and transcribes after server changes")
 def check_cli_regression(config, fixtures):
     if not config.runtime_bin:
-        return CheckResult("cli_regression", True, "whisper_runtime binary not found", skipped=True)
+        return CheckResult("cli_regression",
+                           True,
+                           "whisper_runtime binary not found",
+                           skipped=True)
 
     completed = subprocess.run([
         config.runtime_bin, config.encoder_engine, config.cross_kv_engine,
-        config.decoder_engine, config.tokenizer_dir, config.reference_audio, "128"
+        config.decoder_engine, config.tokenizer_dir, config.reference_audio,
+        "128"
     ],
                                capture_output=True,
                                text=True,
@@ -480,8 +677,10 @@ def check_cli_regression(config, fixtures):
     lines = completed.stdout.splitlines()
     ok = completed.returncode == 0 and " Transcription" in lines
 
-    text = lines[lines.index(" Transcription") + 2] if " Transcription" in lines else ""
+    text = lines[lines.index(" Transcription") +
+                 2] if " Transcription" in lines else ""
 
-    return CheckResult("cli_regression", ok,
-                       "CLI works" if ok else f"CLI exited {completed.returncode}",
-                       [f"{text[:72]!r}"] if ok else [completed.stdout[-400:]])
+    return CheckResult(
+        "cli_regression", ok,
+        "CLI works" if ok else f"CLI exited {completed.returncode}",
+        [f"{text[:72]!r}"] if ok else [completed.stdout[-400:]])

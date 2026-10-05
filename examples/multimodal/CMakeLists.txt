@@ -37,129 +37,78 @@ target_include_directories(
                            ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(action_inference)
 
+add_executable(whisper_encoder_inference whisper_encoder_inference.cpp)
+
+target_link_libraries(whisper_encoder_inference PRIVATE commonLibraryExt)
+
+target_include_directories(
+  whisper_encoder_inference PRIVATE ${COMMON_INCLUDE_DIRS}
+                                    ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_cross_build_link_options(whisper_encoder_inference)
+
 add_executable(
-  whisper_encoder_inference
+  whisper_audio_encoder_runtime
+  whisper_audio_encoder_runtime.cpp whisper_audio_processor.cpp
   whisper_encoder_inference.cpp)
 
-target_link_libraries(
-  whisper_encoder_inference
-  PRIVATE commonLibraryExt)
+target_link_libraries(whisper_audio_encoder_runtime PRIVATE edgellmCore
+                                                            commonLibraryExt)
 
 target_include_directories(
-  whisper_encoder_inference
-  PRIVATE
-    ${COMMON_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR})
+  whisper_audio_encoder_runtime PRIVATE ${COMMON_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_cross_build_link_options(
-  whisper_encoder_inference)
+add_cross_build_link_options(whisper_audio_encoder_runtime)
 
-  add_executable(
-  whisper_audio_encoder_runtime
-  whisper_audio_encoder_runtime.cpp
-  whisper_audio_processor.cpp
-  whisper_encoder_inference.cpp)
+add_executable(whisper_decoder_build whisper_decoder_build.cpp)
 
 target_link_libraries(
-  whisper_audio_encoder_runtime
-  PRIVATE
-    edgellmCore
-    commonLibraryExt)
+  whisper_decoder_build PRIVATE ${NV_ONNX_PARSER_LIB} commonLibraryExt
+                                edgellmBuilder)
 
 target_include_directories(
-  whisper_audio_encoder_runtime
-  PRIVATE
-    ${COMMON_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR})
+  whisper_decoder_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
+                                ${COMMON_INCLUDE_DIRS})
 
-add_cross_build_link_options(
-  whisper_audio_encoder_runtime)
+add_cross_build_link_options(whisper_decoder_build)
 
-  add_executable(
-  whisper_decoder_build
-  whisper_decoder_build.cpp)
+add_executable(whisper_decoder_inference whisper_decoder_inference.cpp)
 
-target_link_libraries(
-  whisper_decoder_build
-  PRIVATE
-    ${NV_ONNX_PARSER_LIB}
-    commonLibraryExt
-    edgellmBuilder)
+target_link_libraries(whisper_decoder_inference PRIVATE edgellmCore
+                                                        commonLibraryExt)
 
 target_include_directories(
-  whisper_decoder_build
-  PRIVATE
-    ${ONNX_PARSER_INCLUDE_DIR}
-    ${COMMON_INCLUDE_DIRS})
+  whisper_decoder_inference PRIVATE ${COMMON_INCLUDE_DIRS}
+                                    ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_cross_build_link_options(
-  whisper_decoder_build)
+add_cross_build_link_options(whisper_decoder_inference)
 
 add_executable(
-  whisper_decoder_inference
-  whisper_decoder_inference.cpp)
+  whisper_runtime whisper_runtime.cpp whisper_audio_processor.cpp
+                  whisper_encoder_inference.cpp whisper_decoder_runner.cpp)
 
-target_link_libraries(
-  whisper_decoder_inference
-  PRIVATE
-    edgellmCore
-    commonLibraryExt)
+target_link_libraries(whisper_runtime PRIVATE edgellmCore commonLibraryExt)
 
-target_include_directories(
-  whisper_decoder_inference
-  PRIVATE
-    ${COMMON_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(whisper_runtime PRIVATE ${COMMON_INCLUDE_DIRS}
+                                                   ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_cross_build_link_options(
-  whisper_decoder_inference)
-
-add_executable(
-  whisper_runtime
-  whisper_runtime.cpp
-  whisper_audio_processor.cpp
-  whisper_encoder_inference.cpp
-  whisper_decoder_runner.cpp)
-
-target_link_libraries(
-  whisper_runtime
-  PRIVATE
-    edgellmCore
-    commonLibraryExt)
-
-target_include_directories(
-  whisper_runtime
-  PRIVATE
-    ${COMMON_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR})
-
-add_cross_build_link_options(
-  whisper_runtime)
+add_cross_build_link_options(whisper_runtime)
 
 # cpp-httplib needs only pthreads; the core libraries do not pull it in.
 find_package(Threads REQUIRED)
 
 add_executable(
   whisper_server
-  whisper_server.cpp
-  whisper_audio_processor.cpp
-  whisper_chunking.cpp
-  whisper_encoder_inference.cpp
-  whisper_decoder_runner.cpp)
+  whisper_server.cpp whisper_audio_processor.cpp whisper_chunking.cpp
+  whisper_prompt.cpp whisper_encoder_inference.cpp whisper_decoder_runner.cpp)
 
-target_link_libraries(
-  whisper_server
-  PRIVATE
-    edgellmCore
-    commonLibraryExt
-    Threads::Threads)
+target_link_libraries(whisper_server PRIVATE edgellmCore commonLibraryExt
+                                             Threads::Threads)
 
 target_include_directories(
   whisper_server
-  PRIVATE
-    ${COMMON_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/3rdParty/httplib
-    ${CMAKE_CURRENT_SOURCE_DIR})
+  PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/3rdParty/httplib
+          ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_cross_build_link_options(
-  whisper_server)
+add_cross_build_link_options(whisper_server)

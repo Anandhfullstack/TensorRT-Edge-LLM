@@ -27,6 +27,7 @@
 #include "whisper_chunking.h"
 #include "whisper_decoder_runner.h"
 #include "whisper_encoder_inference.h"
+#include "whisper_prompt.h"
 
 #include "common/logger.h"
 #include "common/trtUtils.h"
@@ -48,6 +49,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 //! The LOG_* macros expand to an unqualified ``format::fmtstr``, which resolves
@@ -118,23 +120,17 @@ struct ServerOptions
     bool timestampSeek{true};
 };
 
-void printUsage(
-    char const* program)
+void printUsage(char const* program)
 {
-    std::cerr
-        << "Usage:\n"
-        << "  " << program
-        << " <encoder.engine> <cross_kv.engine> <decoder.engine> <tokenizer_dir>\n"
-        << "      [--host 127.0.0.1] [--port 8000] [--slots 1]\n"
-        << "      [--queue-depth 16] [--max-new-tokens 128]\n"
-        << "      [--max-audio-seconds 600] [--overlap-seconds 5]\n"
-        << "      [--long-audio-mode timestamps|overlap]\n";
+    std::cerr << "Usage:\n"
+              << "  " << program << " <encoder.engine> <cross_kv.engine> <decoder.engine> <tokenizer_dir>\n"
+              << "      [--host 127.0.0.1] [--port 8000] [--slots 1]\n"
+              << "      [--queue-depth 16] [--max-new-tokens 128]\n"
+              << "      [--max-audio-seconds 600] [--overlap-seconds 5]\n"
+              << "      [--long-audio-mode timestamps|overlap]\n";
 }
 
-bool parseArgs(
-    int argc,
-    char** argv,
-    ServerOptions& options)
+bool parseArgs(int argc, char** argv, ServerOptions& options)
 {
     if (argc < 5)
     {
@@ -152,8 +148,7 @@ bool parseArgs(
     {
         std::string const flag = argv[i];
 
-        auto next = [&](char const* name) -> char const*
-        {
+        auto next = [&](char const* name) -> char const* {
             if (i + 1 >= argc)
             {
                 std::cerr << "Missing value for " << name << '\n';
@@ -262,8 +257,7 @@ bool parseArgs(
             }
             else
             {
-                std::cerr << "Unknown long-audio mode: " << mode
-                          << " (use timestamps or overlap)\n";
+                std::cerr << "Unknown long-audio mode: " << mode << " (use timestamps or overlap)\n";
 
                 return false;
             }
@@ -314,10 +308,8 @@ bool parseArgs(
 
     if (options.maxAudioSeconds > kLoaderMaxDecodedSeconds)
     {
-        std::cerr
-            << "Max audio seconds must be <= "
-            << kLoaderMaxDecodedSeconds
-            << ": the audio loader refuses to decode anything longer\n";
+        std::cerr << "Max audio seconds must be <= " << kLoaderMaxDecodedSeconds
+                  << ": the audio loader refuses to decode anything longer\n";
 
         return false;
     }
@@ -343,11 +335,9 @@ bool parseArgs(
 class SharedResources
 {
 public:
-    bool load(
-        ServerOptions const& options)
+    bool load(ServerOptions const& options)
     {
-        mRuntime.reset(
-            nvinfer1::createInferRuntime(trt_edgellm::gLogger));
+        mRuntime.reset(nvinfer1::createInferRuntime(trt_edgellm::gLogger));
 
         if (!mRuntime)
         {
@@ -400,10 +390,7 @@ public:
     }
 
 private:
-    bool loadEngine(
-        std::string const& path,
-        std::shared_ptr<nvinfer1::ICudaEngine>& target,
-        char const* label)
+    bool loadEngine(std::string const& path, std::shared_ptr<nvinfer1::ICudaEngine>& target, char const* label)
     {
         target = trt_edgellm::deserializeCudaEngineFromFile(*mRuntime, path);
 
@@ -432,7 +419,8 @@ private:
 // Forced decoder prompt (language / task)
 // ============================================================
 
-//! Builds Whisper's 4-token forced prefix from the request's language and task.
+//! Builds Whisper's 4-token forced prefix from the request's language and task,
+//! and validates and tokenizes hotword context for the ``<|startofprev|>`` slot.
 //!
 //! Token ids come from the tokenizer's special-token map rather than a
 //! hard-coded table, so the set of accepted languages is exactly the set the
@@ -440,30 +428,88 @@ private:
 class PromptBuilder
 {
 public:
-    bool initialize(
-        trt_edgellm::tokenizer::Tokenizer const& tokenizer)
+    bool initialize(trt_edgellm::tokenizer::Tokenizer const& tokenizer)
     {
+        mTokenizer = &tokenizer;
         mSpecialTokens = &tokenizer.getSpecialTokensEncoder();
 
-        return lookup("<|startoftranscript|>", mStartToken)
-            && lookup("<|notimestamps|>", mNoTimestampsToken);
+        for (auto const& entry : *mSpecialTokens)
+        {
+            mSpecialIds.insert(static_cast<int64_t>(entry.second));
+        }
+
+        return lookup("<|startoftranscript|>", mStartToken) && lookup("<|notimestamps|>", mNoTimestampsToken)
+            && lookup("<|startofprev|>", mStartOfPrevToken);
+    }
+
+    int64_t startOfPrevToken() const
+    {
+        return mStartOfPrevToken;
+    }
+
+    enum class HotwordStatus
+    {
+        kOk,
+        kEmpty,
+        kTooLong,
+        kSpecialMarkup,
+        kReservedToken,
+        kTokenizeFailed,
+    };
+
+    //! Validate and tokenize a request's comma-separated hotwords into context
+    //! ids. ``kEmpty`` means no terms were given and the plain prefix applies.
+    HotwordStatus encodeHotwords(std::string const& hotwords, std::vector<int64_t>& context) const
+    {
+        context.clear();
+
+        switch (checkHotwordText(hotwords))
+        {
+        case HotwordTextStatus::kTooLong: return HotwordStatus::kTooLong;
+        case HotwordTextStatus::kSpecialMarkup: return HotwordStatus::kSpecialMarkup;
+        case HotwordTextStatus::kOk: break;
+        }
+
+        std::string const formatted = formatHotwords(hotwords);
+
+        if (formatted.empty())
+        {
+            return HotwordStatus::kEmpty;
+        }
+
+        auto const ids = mTokenizer->encode(promptEncodingInput(formatted), false, false);
+
+        if (ids.empty())
+        {
+            return HotwordStatus::kTokenizeFailed;
+        }
+
+        // Defence in depth behind the "<|" text check: no control token may
+        // reach the prompt however the tokenizer's special matching evolves.
+        for (auto const id : ids)
+        {
+            if (mSpecialIds.count(static_cast<int64_t>(id)) != 0)
+            {
+                return HotwordStatus::kReservedToken;
+            }
+        }
+
+        context.assign(ids.begin(), ids.end());
+
+        return HotwordStatus::kOk;
     }
 
     //! \return false when the language or task is not in the checkpoint's
     //!         vocabulary; the caller turns that into a 400.
     //! \param withTimestamps Omit ``<|notimestamps|>`` so the model is free to
     //!        emit timestamp tokens.
-    bool build(
-        std::string const& language,
-        std::string const& task,
-        bool const withTimestamps,
+    bool build(std::string const& language, std::string const& task, bool const withTimestamps,
         std::vector<int64_t>& prompt) const
     {
         int64_t languageToken = 0;
         int64_t taskToken = 0;
 
-        if (!lookup("<|" + language + "|>", languageToken)
-            || !lookup("<|" + task + "|>", taskToken))
+        if (!lookup("<|" + language + "|>", languageToken) || !lookup("<|" + task + "|>", taskToken))
         {
             return false;
         }
@@ -479,9 +525,7 @@ public:
     }
 
 private:
-    bool lookup(
-        std::string const& token,
-        int64_t& id) const
+    bool lookup(std::string const& token, int64_t& id) const
     {
         auto const found = mSpecialTokens->find(token);
 
@@ -496,15 +540,29 @@ private:
     }
 
 private:
+    trt_edgellm::tokenizer::Tokenizer const* mTokenizer{nullptr};
     trt_edgellm::tokenizer::TokenToRanks const* mSpecialTokens{nullptr};
+    std::unordered_set<int64_t> mSpecialIds;
 
     int64_t mStartToken{0};
     int64_t mNoTimestampsToken{0};
+    int64_t mStartOfPrevToken{0};
 };
 
 // ============================================================
 // One pipeline slot
 // ============================================================
+
+//! Forced prefixes for one request. The fallbacks are the plain prefixes, set
+//! only when the primary ones carry hotword context: a window whose prompted
+//! decode stopped early is decoded again without it.
+struct DecodePrompts
+{
+    std::vector<int64_t> const* shortPrompt{nullptr};
+    std::vector<int64_t> const* timestampPrompt{nullptr};
+    std::vector<int64_t> const* shortFallback{nullptr};
+    std::vector<int64_t> const* timestampFallback{nullptr};
+};
 
 //! Mel front-end, encoder, cross-KV projection and decoder for one slot. Not
 //! thread-safe: the decoder holds per-request cache state and a CUDA graph
@@ -512,15 +570,12 @@ private:
 class WhisperPipeline
 {
 public:
-    WhisperPipeline(
-        SharedResources const& shared,
-        ServerOptions const& options)
+    WhisperPipeline(SharedResources const& shared, ServerOptions const& options)
         : mEncoder(shared.runtime(), shared.encoderEngine())
         , mDecoder(shared.runtime(), shared.crossKvEngine(), shared.decoderEngine())
         , mTokenizer(shared.tokenizer())
         , mMaxNewTokens(options.maxNewTokens)
-        , mOverlapSamples(static_cast<std::size_t>(
-              options.overlapSeconds * kWhisperSampleRate))
+        , mOverlapSamples(static_cast<std::size_t>(options.overlapSeconds * kWhisperSampleRate))
         , mMaxOverlapWords(maxOverlapWordsFor(options.overlapSeconds))
         , mTimestampSeek(options.timestampSeek)
     {
@@ -546,15 +601,17 @@ public:
     }
 
     //! Drive one utterance end to end. `pcm` is padded or trimmed in place.
-    //! `prompt` is the 4-token forced prefix; nullptr uses the built-in English
-    //! transcribe prompt.
-    bool transcribe(
-        trt_edgellm::rt::audio::AudioPCM& pcm,
-        std::vector<int64_t> const* prompt,
-        std::string& text,
-        bool const emitTimestamps = false,
+    //! `prompt` is the forced prefix, possibly with hotword context; nullptr uses
+    //! the built-in English transcribe prompt. `fallbackPrompt`, when set, is
+    //! decoded instead if the prompted output looks truncated; the encoder
+    //! output is reused, so only the decoder runs again.
+    bool transcribe(trt_edgellm::rt::audio::AudioPCM& pcm, std::vector<int64_t> const* prompt,
+        std::vector<int64_t> const* fallbackPrompt, std::string& text, bool const emitTimestamps = false,
         std::vector<int64_t>* rawTokens = nullptr)
     {
+        // Taken before processPcm pads the window to 30 s.
+        double const windowSeconds = static_cast<double>(pcm.samples.size()) / static_cast<double>(pcm.sampleRate);
+
         mFeatures.clear();
 
         if (!mProcessor.processPcm(pcm, mFeatures))
@@ -576,23 +633,25 @@ public:
             return false;
         }
 
+        text = decodePrefix(mTokens, mTokens.size());
+
+        if (fallbackPrompt != nullptr && looksTruncated(stripEndOfTextMarker(text), windowSeconds))
+        {
+            LOG_INFO("hotword decode stopped early (%zu tokens for %.1f s); decoding without hotwords", mTokens.size(),
+                windowSeconds);
+
+            if (!mDecoder.generate(mEncoderOutput, mTokens, mMaxNewTokens, fallbackPrompt, emitTimestamps))
+            {
+                return false;
+            }
+
+            text = decodePrefix(mTokens, mTokens.size());
+        }
+
         if (rawTokens != nullptr)
         {
             *rawTokens = mTokens;
         }
-
-        // Tokenizer expects int32_t Rank.
-        std::vector<trt_edgellm::tokenizer::Rank> decodeTokens;
-
-        decodeTokens.reserve(mTokens.size());
-
-        for (int64_t token : mTokens)
-        {
-            decodeTokens.push_back(
-                static_cast<trt_edgellm::tokenizer::Rank>(token));
-        }
-
-        text = mTokenizer.decode(decodeTokens, true);
 
         return true;
     }
@@ -605,11 +664,7 @@ public:
     //! slot, so one long request occupies one slot for the whole of it.
     //!
     //! \param windowCount Windows actually decoded, for logging. May be null.
-    bool transcribeAny(
-        trt_edgellm::rt::audio::AudioPCM& pcm,
-        std::vector<int64_t> const* shortPrompt,
-        std::vector<int64_t> const* timestampPrompt,
-        std::string& text,
+    bool transcribeAny(trt_edgellm::rt::audio::AudioPCM& pcm, DecodePrompts const& prompts, std::string& text,
         std::size_t* windowCount = nullptr)
     {
         if (pcm.samples.size() <= kWhisperPcmSamples)
@@ -619,23 +674,20 @@ public:
                 *windowCount = 1;
             }
 
-            return transcribe(pcm, shortPrompt, text);
+            return transcribe(pcm, prompts.shortPrompt, prompts.shortFallback, text);
         }
 
         return mTimestampSeek
-            ? transcribeByTimestampSeek(pcm, timestampPrompt, text, windowCount)
-            : transcribeByFixedStride(pcm, shortPrompt, text, windowCount);
+            ? transcribeByTimestampSeek(pcm, prompts.timestampPrompt, prompts.timestampFallback, text, windowCount)
+            : transcribeByFixedStride(pcm, prompts.shortPrompt, prompts.shortFallback, text, windowCount);
     }
 
 private:
     //! Whisper's own long-form strategy: decode a window, seek to the last
     //! timestamp the model emitted, repeat. Windows do not overlap, so there is
     //! nothing to de-duplicate and genuinely repeated speech survives.
-    bool transcribeByTimestampSeek(
-        trt_edgellm::rt::audio::AudioPCM& pcm,
-        std::vector<int64_t> const* prompt,
-        std::string& text,
-        std::size_t* windowCount)
+    bool transcribeByTimestampSeek(trt_edgellm::rt::audio::AudioPCM& pcm, std::vector<int64_t> const* prompt,
+        std::vector<int64_t> const* fallbackPrompt, std::string& text, std::size_t* windowCount)
     {
         std::size_t const total = pcm.samples.size();
         std::size_t seek = 0;
@@ -649,14 +701,13 @@ private:
 
             mWindowPcm.sampleRate = pcm.sampleRate;
             mWindowPcm.numChannels = pcm.numChannels;
-            mWindowPcm.samples.assign(
-                pcm.samples.begin() + static_cast<std::ptrdiff_t>(seek),
+            mWindowPcm.samples.assign(pcm.samples.begin() + static_cast<std::ptrdiff_t>(seek),
                 pcm.samples.begin() + static_cast<std::ptrdiff_t>(seek + count));
 
             std::string windowText;
             std::vector<int64_t> windowTokens;
 
-            if (!transcribe(mWindowPcm, prompt, windowText, true, &windowTokens))
+            if (!transcribe(mWindowPcm, prompt, fallbackPrompt, windowText, true, &windowTokens))
             {
                 return false;
             }
@@ -665,9 +716,8 @@ private:
 
             bool const isFinalWindow = count < kWhisperPcmSamples;
 
-            WindowSeek const seekPlan = planWindowSeek(windowTokens,
-                kWhisperTimestampBeginToken, kWhisperTimestampPrecision,
-                static_cast<double>(kWhisperChunkSeconds));
+            WindowSeek const seekPlan = planWindowSeek(windowTokens, kWhisperTimestampBeginToken,
+                kWhisperTimestampPrecision, static_cast<double>(kWhisperChunkSeconds));
 
             // A cut-off tail is dropped here and re-decoded by the next window;
             // emitting it as well is what duplicates text. The final window has
@@ -716,14 +766,10 @@ private:
     //! Fixed-stride windows joined by text-overlap matching. Superseded by
     //! timestamp seeking; kept so timestamp decoding can be bisected against a
     //! known-good path.
-    bool transcribeByFixedStride(
-        trt_edgellm::rt::audio::AudioPCM& pcm,
-        std::vector<int64_t> const* prompt,
-        std::string& text,
-        std::size_t* windowCount)
+    bool transcribeByFixedStride(trt_edgellm::rt::audio::AudioPCM& pcm, std::vector<int64_t> const* prompt,
+        std::vector<int64_t> const* fallbackPrompt, std::string& text, std::size_t* windowCount)
     {
-        std::vector<AudioWindow> const windows
-            = planWindows(pcm.samples.size(), kWhisperPcmSamples, mOverlapSamples);
+        std::vector<AudioWindow> const windows = planWindows(pcm.samples.size(), kWhisperPcmSamples, mOverlapSamples);
 
         if (windowCount != nullptr)
         {
@@ -736,14 +782,12 @@ private:
         {
             mWindowPcm.sampleRate = pcm.sampleRate;
             mWindowPcm.numChannels = pcm.numChannels;
-            mWindowPcm.samples.assign(
-                pcm.samples.begin() + static_cast<std::ptrdiff_t>(window.startSample),
-                pcm.samples.begin()
-                    + static_cast<std::ptrdiff_t>(window.startSample + window.sampleCount));
+            mWindowPcm.samples.assign(pcm.samples.begin() + static_cast<std::ptrdiff_t>(window.startSample),
+                pcm.samples.begin() + static_cast<std::ptrdiff_t>(window.startSample + window.sampleCount));
 
             std::string windowText;
 
-            if (!transcribe(mWindowPcm, prompt, windowText))
+            if (!transcribe(mWindowPcm, prompt, fallbackPrompt, windowText))
             {
                 return false;
             }
@@ -757,12 +801,9 @@ private:
     }
 
 public:
-
     //! Decode the first \p count token ids to text. Whisper special tokens,
     //! timestamps included, are dropped by the tokenizer.
-    std::string decodePrefix(
-        std::vector<int64_t> const& tokens,
-        std::size_t const count) const
+    std::string decodePrefix(std::vector<int64_t> const& tokens, std::size_t const count) const
     {
         std::vector<trt_edgellm::tokenizer::Rank> ranks;
 
@@ -788,7 +829,7 @@ public:
 
         std::string text;
 
-        return transcribe(silence, nullptr, text);  // short path only
+        return transcribe(silence, nullptr, nullptr, text); // short path only
     }
 
 private:
@@ -818,9 +859,7 @@ private:
 class PipelinePool
 {
 public:
-    bool initialize(
-        SharedResources const& shared,
-        ServerOptions const& options)
+    bool initialize(SharedResources const& shared, ServerOptions const& options)
     {
         // Slots are built one at a time on purpose: each one captures its own
         // decode CUDA graph, and serialising capture keeps concurrent
@@ -858,8 +897,7 @@ public:
         return index;
     }
 
-    void release(
-        int index)
+    void release(int index)
     {
         {
             std::lock_guard<std::mutex> const lock(mMutex);
@@ -870,8 +908,7 @@ public:
         mAvailable.notify_one();
     }
 
-    WhisperPipeline& at(
-        int index) noexcept
+    WhisperPipeline& at(int index) noexcept
     {
         return *mSlots[static_cast<std::size_t>(index)];
     }
@@ -893,8 +930,7 @@ private:
 class PipelineLease
 {
 public:
-    explicit PipelineLease(
-        PipelinePool& pool)
+    explicit PipelineLease(PipelinePool& pool)
         : mPool(pool)
         , mIndex(pool.acquire())
     {
@@ -927,8 +963,7 @@ private:
 class Admission
 {
 public:
-    explicit Admission(
-        int capacity) noexcept
+    explicit Admission(int capacity) noexcept
         : mCapacity(capacity)
     {
     }
@@ -940,10 +975,7 @@ public:
         while (current < mCapacity)
         {
             if (mCount.compare_exchange_weak(
-                    current,
-                    current + 1,
-                    std::memory_order_acquire,
-                    std::memory_order_relaxed))
+                    current, current + 1, std::memory_order_acquire, std::memory_order_relaxed))
             {
                 return true;
             }
@@ -970,8 +1002,7 @@ private:
 class AdmissionTicket
 {
 public:
-    explicit AdmissionTicket(
-        Admission& admission) noexcept
+    explicit AdmissionTicket(Admission& admission) noexcept
         : mAdmission(admission)
     {
     }
@@ -992,10 +1023,7 @@ private:
 // HTTP helpers
 // ============================================================
 
-void sendError(
-    httplib::Response& response,
-    int status,
-    std::string const& message)
+void sendError(httplib::Response& response, int status, std::string const& message)
 {
     json const body = {{"error", message}};
 
@@ -1003,29 +1031,22 @@ void sendError(
     response.set_content(body.dump(), "application/json");
 }
 
-std::string formField(
-    httplib::Request const& request,
-    char const* name,
-    std::string const& fallback = "")
+std::string formField(httplib::Request const& request, char const* name, std::string const& fallback = "")
 {
-    return request.has_file(name)
-        ? request.get_file_value(name).content
-        : fallback;
+    return request.has_file(name) ? request.get_file_value(name).content : fallback;
 }
 
-std::string toLower(
-    std::string value)
+std::string toLower(std::string value)
 {
-    std::transform(value.begin(), value.end(), value.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(
+        value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
     return value;
 }
 
 httplib::Server* gServer = nullptr;
 
-void handleSignal(
-    int)
+void handleSignal(int)
 {
     if (gServer != nullptr)
     {
@@ -1035,9 +1056,7 @@ void handleSignal(
 
 } // namespace
 
-int main(
-    int argc,
-    char** argv)
+int main(int argc, char** argv)
 {
     ServerOptions options;
 
@@ -1062,10 +1081,7 @@ int main(
 
     if (cudaInitStatus != cudaSuccess)
     {
-        std::cerr
-            << "CUDA context init failed: "
-            << cudaGetErrorString(cudaInitStatus)
-            << '\n';
+        std::cerr << "CUDA context init failed: " << cudaGetErrorString(cudaInitStatus) << '\n';
 
         return 1;
     }
@@ -1084,6 +1100,16 @@ int main(
         LOG_ERROR("Tokenizer is missing Whisper's control tokens; is this a Whisper checkpoint?");
 
         return 1;
+    }
+
+    // Sized for the longest forced prefix so the short and timestamp prompts
+    // carry the same context.
+    int32_t const hotwordBudget = promptContextBudget(kWhisperPromptLength, options.maxNewTokens);
+
+    if (hotwordBudget <= 0)
+    {
+        LOG_WARNING("--maxNewTokens %d leaves no decoder capacity for hotwords; hotword requests will be refused",
+            options.maxNewTokens);
     }
 
     PipelinePool pool;
@@ -1114,187 +1140,216 @@ int main(
 
     server.new_task_queue = [socketThreads] { return new httplib::ThreadPool(socketThreads); };
 
-    server.Get("/health",
-        [&](httplib::Request const&, httplib::Response& response)
+    server.Get("/health", [&](httplib::Request const&, httplib::Response& response) {
+        json const body = {
+            {"status", "ok"},
+            {"slots", pool.size()},
+            {"busy", admission.inFlight()},
+            {"queue_depth", options.queueDepth},
+        };
+
+        response.set_content(body.dump(), "application/json");
+    });
+
+    server.Get("/v1/models", [&](httplib::Request const&, httplib::Response& response) {
+        json const body = {
+            {"object", "list"},
+            {"data",
+                json::array({json{
+                    {"id", "whisper-small"},
+                    {"object", "model"},
+                    {"owned_by", "tensorrt-edgellm"},
+                }})},
+        };
+
+        response.set_content(body.dump(), "application/json");
+    });
+
+    server.Post("/v1/audio/transcriptions", [&](httplib::Request const& request, httplib::Response& response) {
+        std::string const responseFormat = formField(request, "response_format", "json");
+
+        if (responseFormat != "json" && responseFormat != "text")
         {
-            json const body = {
-                {"status", "ok"},
-                {"slots", pool.size()},
-                {"busy", admission.inFlight()},
-                {"queue_depth", options.queueDepth},
-            };
+            sendError(response, 400, "unsupported response_format '" + responseFormat + "'; use json or text");
 
-            response.set_content(body.dump(), "application/json");
-        });
+            return;
+        }
 
-    server.Get("/v1/models",
-        [&](httplib::Request const&, httplib::Response& response)
+        // Whisper's forced prefix is <|sot|> <|lang|> <|task|> <|notimestamps|>.
+        // Both ids are resolved against the checkpoint's own vocabulary.
+        std::string const language = toLower(formField(request, "language", "en"));
+        std::string const task = toLower(formField(request, "task", "transcribe"));
+
+        if (task != "transcribe" && task != "translate")
         {
-            json const body = {
-                {"object", "list"},
-                {"data", json::array({json{
-                             {"id", "whisper-small"},
-                             {"object", "model"},
-                             {"owned_by", "tensorrt-edgellm"},
-                         }})},
-            };
+            sendError(response, 400, "unsupported task '" + task + "'; use transcribe or translate");
 
-            response.set_content(body.dump(), "application/json");
-        });
+            return;
+        }
 
-    server.Post("/v1/audio/transcriptions",
-        [&](httplib::Request const& request, httplib::Response& response)
+        // Two prefixes: the short path keeps <|notimestamps|> so its output
+        // stays exactly what it was, while long audio drops it so the model
+        // can mark segment boundaries for the seek.
+        std::vector<int64_t> shortPrompt;
+        std::vector<int64_t> timestampPrompt;
+
+        if (!promptBuilder.build(language, task, false, shortPrompt)
+            || !promptBuilder.build(language, task, true, timestampPrompt))
         {
-            std::string const responseFormat = formField(request, "response_format", "json");
+            sendError(response, 400,
+                "unsupported language '" + language + "'; expected an ISO-639-1 code the model supports");
 
-            if (responseFormat != "json" && responseFormat != "text")
+            return;
+        }
+
+        std::vector<int64_t> hotwordContext;
+
+        switch (promptBuilder.encodeHotwords(formField(request, "hotwords"), hotwordContext))
+        {
+        case PromptBuilder::HotwordStatus::kOk:
+        case PromptBuilder::HotwordStatus::kEmpty: break;
+        case PromptBuilder::HotwordStatus::kTooLong:
+            sendError(response, 413, "hotwords exceeds " + std::to_string(kMaxHotwordBytes) + " bytes");
+            return;
+        case PromptBuilder::HotwordStatus::kSpecialMarkup:
+            sendError(response, 400, "hotwords must not contain special-token markup '<|'");
+            return;
+        case PromptBuilder::HotwordStatus::kReservedToken:
+            sendError(response, 400, "hotwords encode to a reserved control token");
+            return;
+        case PromptBuilder::HotwordStatus::kTokenizeFailed:
+            sendError(response, 400, "hotwords could not be tokenized");
+            return;
+        }
+
+        DecodePrompts prompts{&shortPrompt, &timestampPrompt, nullptr, nullptr};
+        std::vector<int64_t> shortHotwordPrompt;
+        std::vector<int64_t> timestampHotwordPrompt;
+
+        if (!hotwordContext.empty())
+        {
+            if (hotwordBudget <= 0)
             {
                 sendError(response, 400,
-                    "unsupported response_format '" + responseFormat + "'; use json or text");
+                    "hotwords not available: --maxNewTokens " + std::to_string(options.maxNewTokens)
+                        + " leaves no decoder capacity");
 
                 return;
             }
 
-            // Whisper's forced prefix is <|sot|> <|lang|> <|task|> <|notimestamps|>.
-            // Both ids are resolved against the checkpoint's own vocabulary.
-            std::string const language = toLower(formField(request, "language", "en"));
-            std::string const task = toLower(formField(request, "task", "transcribe"));
-
-            if (task != "transcribe" && task != "translate")
+            if (hotwordContext.size() > static_cast<std::size_t>(hotwordBudget))
             {
-                sendError(response, 400,
-                    "unsupported task '" + task + "'; use transcribe or translate");
+                LOG_DEBUG("hotwords truncated to the last %d of %zu tokens", hotwordBudget, hotwordContext.size());
+            }
+
+            shortHotwordPrompt
+                = assemblePrompt(promptBuilder.startOfPrevToken(), hotwordContext, shortPrompt, hotwordBudget);
+            timestampHotwordPrompt
+                = assemblePrompt(promptBuilder.startOfPrevToken(), hotwordContext, timestampPrompt, hotwordBudget);
+
+            prompts = {&shortHotwordPrompt, &timestampHotwordPrompt, &shortPrompt, &timestampPrompt};
+        }
+
+        if (!request.has_file("file"))
+        {
+            sendError(response, 400, "missing required form field 'file'");
+
+            return;
+        }
+
+        auto const& upload = request.get_file_value("file");
+
+        if (upload.content.empty())
+        {
+            sendError(response, 400, "empty audio file");
+
+            return;
+        }
+
+        if (upload.content.size() > kMaxUploadBytes)
+        {
+            sendError(response, 413,
+                "audio upload exceeds the supported maximum of " + std::to_string(kMaxUploadBytes) + " bytes");
+
+            return;
+        }
+
+        // Decode and validate before claiming a slot, so a malformed or
+        // over-long upload never occupies the pipeline.
+        trt_edgellm::rt::audio::AudioPCM pcm;
+
+        if (!WhisperAudioProcessor::decodeBytes(
+                reinterpret_cast<uint8_t const*>(upload.content.data()), upload.content.size(), pcm))
+        {
+            // The loader also refuses a decode longer than its own cap, and
+            // reports that the same way as a malformed container, so the
+            // message has to cover both.
+            sendError(response, 400,
+                "could not decode audio; expected wav, mp3 or flac no longer than "
+                    + std::to_string(static_cast<int>(kLoaderMaxDecodedSeconds)) + " s");
+
+            return;
+        }
+
+        double const durationSeconds = static_cast<double>(pcm.samples.size()) / static_cast<double>(pcm.sampleRate);
+
+        if (durationSeconds > options.maxAudioSeconds)
+        {
+            sendError(response, 413,
+                "audio is " + std::to_string(durationSeconds) + " s; this server accepts up to "
+                    + std::to_string(static_cast<int>(options.maxAudioSeconds)) + " s");
+
+            return;
+        }
+
+        if (!admission.tryAcquire())
+        {
+            response.set_header("Retry-After", "1");
+            sendError(response, 503, "server overloaded: request queue is full");
+
+            return;
+        }
+
+        AdmissionTicket ticket(admission);
+
+        std::string text;
+
+        {
+            PipelineLease lease(pool);
+
+            std::size_t windows = 0;
+
+            if (!lease.pipeline().transcribeAny(pcm, prompts, text, &windows))
+            {
+                sendError(response, 500, "transcription failed");
 
                 return;
             }
 
-            // Two prefixes: the short path keeps <|notimestamps|> so its output
-            // stays exactly what it was, while long audio drops it so the model
-            // can mark segment boundaries for the seek.
-            std::vector<int64_t> shortPrompt;
-            std::vector<int64_t> timestampPrompt;
+            LOG_DEBUG("transcribed %.2f s in %zu window(s)", durationSeconds, windows);
+        }
 
-            if (!promptBuilder.build(language, task, false, shortPrompt)
-                || !promptBuilder.build(language, task, true, timestampPrompt))
-            {
-                sendError(response, 400,
-                    "unsupported language '" + language
-                        + "'; expected an ISO-639-1 code the model supports");
+        if (responseFormat == "text")
+        {
+            response.set_content(text, "text/plain");
 
-                return;
-            }
+            return;
+        }
 
-            if (!request.has_file("file"))
-            {
-                sendError(response, 400, "missing required form field 'file'");
+        json const body = {{"text", text}};
 
-                return;
-            }
+        response.set_content(body.dump(), "application/json");
+    });
 
-            auto const& upload = request.get_file_value("file");
-
-            if (upload.content.empty())
-            {
-                sendError(response, 400, "empty audio file");
-
-                return;
-            }
-
-            if (upload.content.size() > kMaxUploadBytes)
-            {
-                sendError(response, 413,
-                    "audio upload exceeds the supported maximum of "
-                        + std::to_string(kMaxUploadBytes) + " bytes");
-
-                return;
-            }
-
-            // Decode and validate before claiming a slot, so a malformed or
-            // over-long upload never occupies the pipeline.
-            trt_edgellm::rt::audio::AudioPCM pcm;
-
-            if (!WhisperAudioProcessor::decodeBytes(
-                    reinterpret_cast<uint8_t const*>(upload.content.data()),
-                    upload.content.size(),
-                    pcm))
-            {
-                // The loader also refuses a decode longer than its own cap, and
-                // reports that the same way as a malformed container, so the
-                // message has to cover both.
-                sendError(response, 400,
-                    "could not decode audio; expected wav, mp3 or flac no longer than "
-                        + std::to_string(static_cast<int>(kLoaderMaxDecodedSeconds)) + " s");
-
-                return;
-            }
-
-            double const durationSeconds
-                = static_cast<double>(pcm.samples.size())
-                / static_cast<double>(pcm.sampleRate);
-
-            if (durationSeconds > options.maxAudioSeconds)
-            {
-                sendError(response, 413,
-                    "audio is " + std::to_string(durationSeconds)
-                        + " s; this server accepts up to "
-                        + std::to_string(static_cast<int>(options.maxAudioSeconds)) + " s");
-
-                return;
-            }
-
-            if (!admission.tryAcquire())
-            {
-                response.set_header("Retry-After", "1");
-                sendError(response, 503, "server overloaded: request queue is full");
-
-                return;
-            }
-
-            AdmissionTicket ticket(admission);
-
-            std::string text;
-
-            {
-                PipelineLease lease(pool);
-
-                std::size_t windows = 0;
-
-                if (!lease.pipeline().transcribeAny(
-                        pcm, &shortPrompt, &timestampPrompt, text, &windows))
-                {
-                    sendError(response, 500, "transcription failed");
-
-                    return;
-                }
-
-                LOG_DEBUG("transcribed %.2f s in %zu window(s)", durationSeconds, windows);
-            }
-
-            if (responseFormat == "text")
-            {
-                response.set_content(text, "text/plain");
-
-                return;
-            }
-
-            json const body = {{"text", text}};
-
-            response.set_content(body.dump(), "application/json");
-        });
-
-    LOG_INFO("Whisper server listening on %s:%d (slots %d, queue depth %d, max new tokens %d, "
-             "max audio %.0f s, long-audio mode %s)",
+    LOG_INFO(
+        "Whisper server listening on %s:%d (slots %d, queue depth %d, max new tokens %d, "
+        "max audio %.0f s, long-audio mode %s)",
         options.host.c_str(), options.port, pool.size(), options.queueDepth, options.maxNewTokens,
         options.maxAudioSeconds, options.timestampSeek ? "timestamps" : "overlap");
 
     if (!server.listen(options.host, options.port))
     {
-        std::cerr
-            << "Failed to bind "
-            << options.host
-            << ':'
-            << options.port
-            << '\n';
+        std::cerr << "Failed to bind " << options.host << ':' << options.port << '\n';
 
         return 1;
     }

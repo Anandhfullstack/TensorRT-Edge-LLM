@@ -43,6 +43,8 @@ Exit code is 0 when everything passed, 1 on any failure, 2 on a setup problem
 | `input_rejection` | 8 malformed/oversize/boundary inputs get the right status, and none occupies a slot | ~25 s |
 | `backpressure` | Load past the queue is shed with 503 + `Retry-After`, never queued or hung | ~20 s |
 | `language_task` | `language` and `task` actually change the forced prompt; bad values are refused | ~20 s |
+| `hotwords` | `hotwords` injection (`<|…|>`) and oversize input are refused, over-budget lists are truncated, empty lists and later plain requests are byte-identical to no hotwords | ~25 s |
+| `hotword_isolation` | 4 clips × 4 hotword lists (one plain), 12 in flight: every response matches its own sequential baseline, so no context leaks between requests or slots | ~60 s |
 | `memory_leak` | Resident memory **plateaus** rather than growing per request | ~3 min |
 | `long_audio` | Audio past one 30 s window is windowed, seeked and joined; text grows with duration | ~40 s |
 | `long_audio_modes` | Timestamp seeking retains repeated speech that overlap matching drops | ~60 s |
